@@ -143,8 +143,8 @@ func NewSelector(reg *registry.Registry, retry int) *Selector {
 // Pick chooses the next unused key for model.
 // preferSupplier (if non-empty) prefers remaining keys from that provider Name first.
 // skipSuppliers excludes all keys under those provider Names (dead relay).
-// Selection order: lower provider Priority first, then lower EntryPriority within the same
-// provider tier, then round-robin order among ties.
+// Selection order: choose the lowest provider Priority first (round-robin among
+// provider ties), then choose the lowest EntryPriority only within that provider.
 func (s *Selector) Pick(model string, tried map[string]struct{}, preferSupplier string, skipSuppliers map[string]struct{}) (registry.UpstreamKey, string, error) {
 	_, keys, ok := s.reg.Resolve(model)
 	if !ok || len(keys) == 0 {
@@ -157,9 +157,8 @@ func (s *Selector) Pick(model string, tried map[string]struct{}, preferSupplier 
 	}
 
 	tryPick := func(restrictSupplier string) (registry.UpstreamKey, bool) {
-		var best *registry.UpstreamKey
-		bestPri := int(^uint(0) >> 1)
-		bestEntryPri := int(^uint(0) >> 1)
+		selectedSupplier := ""
+		bestProviderPri := int(^uint(0) >> 1)
 		for _, k := range ordered {
 			if tried != nil {
 				if _, used := tried[k.ID]; used {
@@ -174,17 +173,32 @@ func (s *Selector) Pick(model string, tried map[string]struct{}, preferSupplier 
 					continue
 				}
 			}
-			if best == nil || k.Priority < bestPri || (k.Priority == bestPri && k.EntryPriority < bestEntryPri) {
-				cp := k
-				best = &cp
-				bestPri = k.Priority
+			if k.Priority < bestProviderPri {
+				selectedSupplier = k.Name
+				bestProviderPri = k.Priority
+			}
+		}
+		if selectedSupplier == "" {
+			return registry.UpstreamKey{}, false
+		}
+
+		var best registry.UpstreamKey
+		bestEntryPri := int(^uint(0) >> 1)
+		for _, k := range ordered {
+			if k.Name != selectedSupplier {
+				continue
+			}
+			if tried != nil {
+				if _, used := tried[k.ID]; used {
+					continue
+				}
+			}
+			if k.EntryPriority < bestEntryPri {
+				best = k
 				bestEntryPri = k.EntryPriority
 			}
 		}
-		if best == nil {
-			return registry.UpstreamKey{}, false
-		}
-		return *best, true
+		return best, true
 	}
 
 	if preferSupplier != "" {

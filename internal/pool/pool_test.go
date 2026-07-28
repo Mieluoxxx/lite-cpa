@@ -101,6 +101,41 @@ func TestPickEntryPriorityWithinProvider(t *testing.T) {
 	}
 }
 
+func TestPickDoesNotCompareEntryPriorityAcrossProviders(t *testing.T) {
+	cfg := &config.Config{
+		OpenAIResponses: []config.Provider{
+			{
+				Name:     "first",
+				Priority: 0,
+				BaseURL:  "https://first.example",
+				APIKeyEntries: []config.APIKeyEntry{
+					{APIKey: "sk-first-low", Priority: 2},
+					{APIKey: "sk-first-high", Priority: 1},
+				},
+				Models: []config.ModelAlias{{Name: "m"}},
+			},
+			{
+				Name:     "second",
+				Priority: 0,
+				BaseURL:  "https://second.example",
+				APIKeyEntries: []config.APIKeyEntry{
+					{APIKey: "sk-second", Priority: 0},
+				},
+				Models: []config.ModelAlias{{Name: "m"}},
+			},
+		},
+	}
+	sel := pool.NewSelector(pool.BuildRegistry(cfg), 0)
+
+	k, _, err := sel.Pick("m", nil, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k.Name != "first" || k.APIKey != "sk-first-high" {
+		t.Fatalf("pick = %s/%s, want first/sk-first-high", k.Name, k.APIKey)
+	}
+}
+
 func TestExpandStoresProviderAndEntryPriority(t *testing.T) {
 	cfg := &config.Config{
 		OpenAIResponses: []config.Provider{
