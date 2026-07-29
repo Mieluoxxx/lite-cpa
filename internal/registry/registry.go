@@ -110,6 +110,26 @@ func (r *Registry) List() []ModelInfo {
 	return out
 }
 
+// ReplaceFrom atomically replaces this registry's model map with a clone of
+// other. Used by config hot-reload so readers always see a consistent set.
+func (r *Registry) ReplaceFrom(other *Registry) {
+	if other == nil {
+		r.mu.Lock()
+		r.models = make(map[string]*modelEntry)
+		r.mu.Unlock()
+		return
+	}
+	other.mu.RLock()
+	next := make(map[string]*modelEntry, len(other.models))
+	for k, v := range other.models {
+		next[k] = v
+	}
+	other.mu.RUnlock()
+	r.mu.Lock()
+	r.models = next
+	r.mu.Unlock()
+}
+
 // LookupModelInfo is used by ported translators for thinking capability checks.
 // Lite treats all config models as user-defined adaptive-capable.
 func LookupModelInfo(modelID string, provider ...string) *ModelInfo {

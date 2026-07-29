@@ -12,6 +12,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mieluoxxx/lite-cpa/internal/access"
@@ -28,6 +30,7 @@ import (
 )
 
 type Server struct {
+	cfgMu    sync.RWMutex
 	cfg      *config.Config
 	reg      *registry.Registry
 	selector *pool.Selector
@@ -35,6 +38,10 @@ type Server struct {
 	auth     *access.Checker
 	logger   *reqlog.Logger
 	http     *http.Server
+
+	maxBody atomic.Int64
+
+	reloadMu sync.Mutex
 }
 
 func New(cfg *config.Config, logger *reqlog.Logger) *Server {
@@ -50,6 +57,7 @@ func New(cfg *config.Config, logger *reqlog.Logger) *Server {
 		auth:     access.New(cfg.APIKeys),
 		logger:   logger,
 	}
+	s.maxBody.Store(cfg.MaxBodyBytes)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /", s.handleRoot)
@@ -69,7 +77,7 @@ func New(cfg *config.Config, logger *reqlog.Logger) *Server {
 	mux.HandleFunc("POST /v1/images/edits", func(w http.ResponseWriter, r *http.Request) {
 		s.handleImages(w, r, "edits")
 	})
-	handler := s.auth.Middleware(limitBody(cfg.MaxBodyBytes, withRecover(mux)))
+	handler := s.auth.Middleware(s.limitBody(withRecover(mux)))
 	addr := net.JoinHostPort(cfg.Host, fmt.Sprintf("%d", cfg.Port))
 	s.http = &http.Server{
 		Addr:              addr,
@@ -90,6 +98,58 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.affinity.Close()
 	}
 	return s.http.Shutdown(ctx)
+}
+
+// Reload applies a newly loaded config in place.
+// host/port and request-log backend settings are immutable at runtime;
+// changing them returns an error and leaves the previous config active.
+// Invalid configs should be rejected by config.Load before calling Reload.
+func (s *Server) Reload(cfg *config.Config) error {
+	if cfg == nil {
+		return fmt.Errorf("reload: nil config")
+	}
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+
+	s.cfgMu.RLock()
+	old := s.cfg
+	s.cfgMu.RUnlock()
+	if old == nil {
+		return fmt.Errorf("reload: server has no active config")
+	}
+
+	if old.Host != cfg.Host || old.Port != cfg.Port {
+		return fmt.Errorf("reload: host/port changes require process restart (was %s:%d, now %s:%d)",
+			old.Host, old.Port, cfg.Host, cfg.Port)
+	}
+	if requestLogIdentity(old.RequestLog) != requestLogIdentity(cfg.RequestLog) {
+		return fmt.Errorf("reload: request-log enable/backend/path/dsn changes require process restart")
+	}
+
+	nextReg := pool.BuildRegistry(cfg)
+	s.reg.ReplaceFrom(nextReg)
+	s.selector.SetRetry(cfg.RequestRetry)
+	s.auth.Replace(cfg.APIKeys)
+	s.affinity.Reconfigure(cfg.ChannelAffinity)
+	s.maxBody.Store(cfg.MaxBodyBytes)
+
+	s.cfgMu.Lock()
+	s.cfg = cfg
+	s.cfgMu.Unlock()
+
+	log.Printf("config reloaded: models=%d retry=%d api-keys=%d",
+		len(s.reg.List()), cfg.RequestRetry, len(cfg.APIKeys))
+	return nil
+}
+
+func requestLogIdentity(c config.RequestLogConfig) string {
+	return fmt.Sprintf("%t|%s|%s|%s|%s",
+		c.Enabled,
+		strings.ToLower(strings.TrimSpace(c.Backend)),
+		strings.TrimSpace(c.SQLite.Path),
+		strings.TrimSpace(c.Postgres.DSN),
+		strings.TrimSpace(c.Retention),
+	)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -179,7 +239,7 @@ func (s *Server) logReq(id string, r *http.Request, protocol, model, provider, u
 		rec.OutputTokens = usage[0].outputTokens
 		rec.CachedTokens = usage[0].cachedTokens
 	}
-	if s.cfg.RequestLog.StoreBody {
+	if s.currentCfg().RequestLog.StoreBody {
 		// Cap stored bodies to keep memory/disk bounded.
 		rec.ReqBody = truncate(string(reqBody), 64<<10)
 		rec.RespBody = truncate(string(respBody), 64<<10)
@@ -221,8 +281,21 @@ func writeAPIError(w http.ResponseWriter, status int, typ, msg string) {
 	})
 }
 
-func limitBody(max int64, next http.Handler) http.Handler {
+func (s *Server) currentCfg() *config.Config {
+	s.cfgMu.RLock()
+	cfg := s.cfg
+	s.cfgMu.RUnlock()
+	return cfg
+}
+
+func (s *Server) debugEnabled() bool {
+	cfg := s.currentCfg()
+	return cfg != nil && cfg.Debug
+}
+
+func (s *Server) limitBody(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		max := s.maxBody.Load()
 		if r.Body != nil && max > 0 {
 			r.Body = http.MaxBytesReader(w, r.Body, max)
 		}
@@ -253,7 +326,7 @@ func (s *Server) forward(
 ) {
 	aff := s.affinity.Lookup(resolveName, r.URL.Path, r.Header, body)
 	if aff.Found {
-		if s.cfg.Debug {
+		if s.debugEnabled() {
 			log.Printf("affinity hit rule=%s key=%s", aff.RuleName, aff.KeyID)
 		}
 	}
@@ -313,7 +386,7 @@ func (s *Server) forward(
 			lastErrLogged = false
 			if aff.Matched && aff.CacheKey != "" && key.ID == aff.KeyID {
 				s.affinity.Clear(aff.CacheKey)
-				if s.cfg.Debug {
+				if s.debugEnabled() {
 					log.Printf("affinity cleared rule=%s key=%s", aff.RuleName, key.ID)
 				}
 			}
@@ -321,7 +394,7 @@ func (s *Server) forward(
 				if se.Code == 401 || se.Code == 403 || se.Code == 429 || se.Code >= 500 {
 					s.logReq(reqID, r, protocol, model, key.Provider, key.Name, se.Code, attemptStart, se.Error(), body, nil)
 					lastErrLogged = true
-					if s.cfg.Debug {
+					if s.debugEnabled() {
 						log.Printf("upstream %s/%s failed status=%d, rotating (mode=%s)", key.Name, key.ID, se.Code, key.FailoverMode)
 					}
 					if aff.Found && aff.SkipRetry && key.ID == aff.KeyID {
@@ -356,9 +429,9 @@ func (s *Server) forward(
 		}
 
 		if aff.Matched {
-			if s.cfg.ChannelAffinity.SwitchOnSuccessOrDefault() || !aff.Found || aff.KeyID == key.ID {
+			if s.currentCfg().ChannelAffinity.SwitchOnSuccessOrDefault() || !aff.Found || aff.KeyID == key.ID {
 				s.affinity.Record(aff.CacheKey, key.ID, aff.TTL)
-				if s.cfg.Debug {
+				if s.debugEnabled() {
 					log.Printf("affinity recorded rule=%s key=%s", aff.RuleName, key.ID)
 				}
 			}
@@ -388,7 +461,7 @@ func (s *Server) forward(
 			var usage tokenUsage
 			for chunk := range v.Chunks {
 				if chunk.Err != nil {
-					if s.cfg.Debug {
+					if s.debugEnabled() {
 						log.Printf("stream error: %v", chunk.Err)
 					}
 					streamErr = chunk.Err.Error()

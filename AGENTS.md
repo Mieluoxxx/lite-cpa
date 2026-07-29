@@ -281,6 +281,20 @@ go build -trimpath -ldflags='-s -w' -o lite-cpa ./cmd/lite-cpa
 
 Optional: run under systemd/supervisor; redirect stdout/stderr for process logs. Request DB (if enabled) is separate under `request-log`.
 
+### Config hot-reload
+
+Runtime reloads the YAML without dropping the listen socket:
+
+- **File mtime poll** every ~1s (debounced 300ms) — works with Docker bind mounts and editor temp+rename saves
+- **`SIGHUP`** — `kill -HUP $(pidof lite-cpa)`
+
+**Hot-swapped:** `api-keys`, providers/models/keys/priority/failover, `request-retry`, `channel-affinity`, `debug`, `max-body-bytes`, global `proxy-url` (via rebuilt keys).
+
+**Requires restart:** `host`, `port`, and request-log `enabled` / `backend` / sqlite path / postgres DSN / retention (logger is opened once at boot).
+
+Invalid YAML or validation errors keep the previous config and log `config reload: ... (keeping previous config)`.
+
+
 ### Docker Compose (recommended)
 
 ```bash
@@ -299,7 +313,7 @@ docker compose down
 
 - Image: multi-stage `golang:1.26-alpine` → `alpine:3.23`, non-root user `lite` (uid 10001).
 - Env: `TZ=Asia/Shanghai` (override as needed).
-- Restart after config edits: `docker compose restart` (config is not hot-reloaded).
+- Config hot-reload: edit `config.yaml` in place (or `kill -HUP <pid>`). Providers / keys / models / affinity / `api-keys` / `request-retry` / `debug` / `max-body-bytes` apply without restart. `host`/`port` and request-log enable/backend/path/dsn still need process restart.
 
 #### Optional Postgres for request-log
 
@@ -353,3 +367,4 @@ Entrypoint: `lite-cpa --config /app/config.yaml`.
 - When `failover-mode: provider`, a failed key adds its `Name` to `skipSuppliers` for the rest of that request.
 - Translator registry: `internal/translator/register.go`; path is client format, upstream type comes from selected key.
 - Request log is async and drop-on-full; do not block the request path on insert.
+- Config hot-reload: `server.Reload` swaps registry/auth/affinity/retry under lock; entrypoint watches mtime + SIGHUP (`internal/config/watcher.go`).

@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -45,25 +46,63 @@ func main() {
 
 	srv := server.New(cfg, logger)
 
+	// Shared reload entry: SIGHUP and file watcher both call this.
+	var reloadMu sync.Mutex
+	reload := func(reason string) {
+		reloadMu.Lock()
+		defer reloadMu.Unlock()
+		next, err := config.Load(*configPath)
+		if err != nil {
+			config.LogReloadError(err)
+			return
+		}
+		if err := srv.Reload(next); err != nil {
+			config.LogReloadError(err)
+			return
+		}
+		log.Printf("config reload ok (%s)", reason)
+		if next.Debug {
+			log.SetFlags(log.LstdFlags | log.Lshortfile)
+		} else {
+			log.SetFlags(log.LstdFlags)
+		}
+	}
+
+	watchCtx, watchCancel := context.WithCancel(context.Background())
+	defer watchCancel()
+	watcher := config.NewWatcher(*configPath, func() { reload("file change") }, time.Second, 300*time.Millisecond)
+	go watcher.Run(watchCtx)
+
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- srv.ListenAndServe()
 	}()
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-	select {
-	case err := <-errCh:
-		if err != nil {
-			log.Fatalf("server: %v", err)
-		}
-	case sig := <-sigCh:
-		log.Printf("signal %v, shutting down", sig)
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(ctx); err != nil {
-			log.Printf("shutdown: %v", err)
+	for {
+		select {
+		case err := <-errCh:
+			watchCancel()
+			if err != nil {
+				log.Fatalf("server: %v", err)
+			}
+			return
+		case sig := <-sigCh:
+			if sig == syscall.SIGHUP {
+				log.Printf("signal %v, reloading config", sig)
+				reload("SIGHUP")
+				continue
+			}
+			log.Printf("signal %v, shutting down", sig)
+			watchCancel()
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			if err := srv.Shutdown(ctx); err != nil {
+				log.Printf("shutdown: %v", err)
+			}
+			cancel()
+			return
 		}
 	}
 }

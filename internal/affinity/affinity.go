@@ -39,6 +39,7 @@ type Match struct {
 
 // Manager owns rule evaluation and the sticky cache.
 type Manager struct {
+	cfgMu           sync.RWMutex
 	enabled         bool
 	switchOnSuccess bool
 	defaultTTL      time.Duration
@@ -59,6 +60,24 @@ type cacheEntry struct {
 
 // New builds a Manager from config. Affinity is on by default when Enabled is omitted.
 func New(setting config.ChannelAffinitySetting) *Manager {
+	m := &Manager{
+		entries:     make(map[string]cacheEntry),
+		stopJanitor: make(chan struct{}),
+	}
+	m.applySetting(setting)
+	return m
+}
+
+// Reconfigure updates sticky rules/settings in place. Existing cache entries are
+// kept; pins whose key IDs disappear after registry reload simply miss.
+func (m *Manager) Reconfigure(setting config.ChannelAffinitySetting) {
+	if m == nil {
+		return
+	}
+	m.applySetting(setting)
+}
+
+func (m *Manager) applySetting(setting config.ChannelAffinitySetting) {
 	ttlSec := setting.DefaultTTLSeconds
 	if ttlSec <= 0 {
 		ttlSec = 600
@@ -67,24 +86,22 @@ func New(setting config.ChannelAffinitySetting) *Manager {
 	if maxEntries <= 0 {
 		maxEntries = 100_000
 	}
-	// Prefer pre-expanded Rules (config.Load); otherwise resolve families/defaults.
 	enabled := setting.EnabledOrDefault()
 	rules := setting.ResolvedRules()
-	m := &Manager{
-		enabled:         enabled,
-		switchOnSuccess: setting.SwitchOnSuccessOrDefault(),
-		defaultTTL:      time.Duration(ttlSec) * time.Second,
-		maxEntries:      maxEntries,
-		rules:           rules,
-		entries:         make(map[string]cacheEntry),
-		stopJanitor:     make(chan struct{}),
-	}
-	if m.enabled {
+
+	m.cfgMu.Lock()
+	m.enabled = enabled
+	m.switchOnSuccess = setting.SwitchOnSuccessOrDefault()
+	m.defaultTTL = time.Duration(ttlSec) * time.Second
+	m.maxEntries = maxEntries
+	m.rules = rules
+	m.cfgMu.Unlock()
+
+	if enabled {
 		m.janitorOnce.Do(func() {
 			go m.janitor()
 		})
 	}
-	return m
 }
 
 // Close stops the background janitor. Safe to call multiple times / on no-op managers.
@@ -102,14 +119,22 @@ func (m *Manager) Close() {
 // Lookup evaluates rules in order and returns the first match.
 // path should be the request URL path (e.g. /v1/messages).
 func (m *Manager) Lookup(model, path string, headers http.Header, body []byte) Match {
-	if m == nil || !m.enabled || len(m.rules) == 0 {
+	if m == nil {
+		return Match{}
+	}
+	m.cfgMu.RLock()
+	enabled := m.enabled
+	rules := m.rules
+	defaultTTL := m.defaultTTL
+	m.cfgMu.RUnlock()
+	if !enabled || len(rules) == 0 {
 		return Match{}
 	}
 	ua := ""
 	if headers != nil {
 		ua = headers.Get("User-Agent")
 	}
-	for _, rule := range m.rules {
+	for _, rule := range rules {
 		if len(rule.ModelRegex) > 0 && !m.matchAnyRegex(rule.ModelRegex, model) {
 			continue
 		}
@@ -127,7 +152,7 @@ func (m *Manager) Lookup(model, path string, headers http.Header, body []byte) M
 		if rule.ValueRegex != "" && !m.matchAnyRegex([]string{rule.ValueRegex}, value) {
 			continue
 		}
-		ttl := m.defaultTTL
+		ttl := defaultTTL
 		if rule.TTLSeconds > 0 {
 			ttl = time.Duration(rule.TTLSeconds) * time.Second
 		}
@@ -151,11 +176,18 @@ func (m *Manager) Lookup(model, path string, headers http.Header, body []byte) M
 // Record pins keyID for a previously matched CacheKey.
 // When switchOnSuccess is true (default), always overwrites with the successful key.
 func (m *Manager) Record(cacheKey, keyID string, ttl time.Duration) {
-	if m == nil || !m.enabled || cacheKey == "" || keyID == "" {
+	if m == nil || cacheKey == "" || keyID == "" {
+		return
+	}
+	m.cfgMu.RLock()
+	enabled := m.enabled
+	defaultTTL := m.defaultTTL
+	m.cfgMu.RUnlock()
+	if !enabled {
 		return
 	}
 	if ttl <= 0 {
-		ttl = m.defaultTTL
+		ttl = defaultTTL
 	}
 	m.set(cacheKey, keyID, ttl)
 }
@@ -377,10 +409,13 @@ func (m *Manager) get(key string) (string, bool) {
 
 func (m *Manager) set(key, keyID string, ttl time.Duration) {
 	now := time.Now()
+	m.cfgMu.RLock()
+	maxEntries := m.maxEntries
+	m.cfgMu.RUnlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, exists := m.entries[key]; !exists {
-		if len(m.entries) >= m.maxEntries {
+		if len(m.entries) >= maxEntries {
 			// Cheap eviction: drop one expired entry, else drop an arbitrary key.
 			evicted := false
 			for k, e := range m.entries {

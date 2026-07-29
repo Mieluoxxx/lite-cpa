@@ -144,6 +144,7 @@ func trimSlash(s string) string {
 
 // Selector does round-robin across keys for a model with failure skip.
 type Selector struct {
+	mu    sync.RWMutex
 	reg   *registry.Registry
 	rr    sync.Map // model -> *uint64
 	retry int
@@ -153,13 +154,26 @@ func NewSelector(reg *registry.Registry, retry int) *Selector {
 	return &Selector{reg: reg, retry: retry}
 }
 
+// SetRetry updates request-retry used by MaxAttempts.
+func (s *Selector) SetRetry(retry int) {
+	if retry < 0 {
+		retry = 0
+	}
+	s.mu.Lock()
+	s.retry = retry
+	s.mu.Unlock()
+}
+
 // Pick chooses the next unused key for model.
 // preferSupplier (if non-empty) prefers remaining keys from that provider Name first.
 // skipSuppliers excludes all keys under those provider Names (dead relay).
 // Selection order: choose the lowest provider Priority first (round-robin among
 // provider ties), then choose the lowest EntryPriority only within that provider.
 func (s *Selector) Pick(model string, tried map[string]struct{}, preferSupplier string, skipSuppliers map[string]struct{}) (registry.UpstreamKey, string, error) {
-	_, keys, ok := s.reg.Resolve(model)
+	s.mu.RLock()
+	reg := s.reg
+	s.mu.RUnlock()
+	_, keys, ok := reg.Resolve(model)
 	if !ok || len(keys) == 0 {
 		return registry.UpstreamKey{}, "", fmt.Errorf("model not found: %s", model)
 	}
@@ -245,11 +259,15 @@ func (s *Selector) nextIndex(model string, n int) int {
 }
 
 func (s *Selector) MaxAttempts(model string) int {
-	_, keys, ok := s.reg.Resolve(model)
+	s.mu.RLock()
+	reg := s.reg
+	retry := s.retry
+	s.mu.RUnlock()
+	_, keys, ok := reg.Resolve(model)
 	if !ok {
 		return 1
 	}
-	max := 1 + s.retry
+	max := 1 + retry
 	if max > len(keys) {
 		max = len(keys)
 	}

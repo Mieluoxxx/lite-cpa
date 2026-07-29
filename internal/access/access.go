@@ -3,13 +3,27 @@ package access
 import (
 	"net/http"
 	"strings"
+	"sync"
 )
 
 type Checker struct {
+	mu   sync.RWMutex
 	keys map[string]struct{}
 }
 
 func New(keys []string) *Checker {
+	return &Checker{keys: keySet(keys)}
+}
+
+// Replace swaps the accepted gateway API keys.
+func (c *Checker) Replace(keys []string) {
+	m := keySet(keys)
+	c.mu.Lock()
+	c.keys = m
+	c.mu.Unlock()
+}
+
+func keySet(keys []string) map[string]struct{} {
 	m := make(map[string]struct{}, len(keys))
 	for _, k := range keys {
 		k = strings.TrimSpace(k)
@@ -17,7 +31,7 @@ func New(keys []string) *Checker {
 			m[k] = struct{}{}
 		}
 	}
-	return &Checker{keys: m}
+	return m
 }
 
 func (c *Checker) Middleware(next http.Handler) http.Handler {
@@ -33,7 +47,10 @@ func (c *Checker) Middleware(next http.Handler) http.Handler {
 			writeUnauthorized(w, "missing api key")
 			return
 		}
-		if _, ok := c.keys[key]; !ok {
+		c.mu.RLock()
+		_, ok := c.keys[key]
+		c.mu.RUnlock()
+		if !ok {
 			writeUnauthorized(w, "invalid api key")
 			return
 		}
