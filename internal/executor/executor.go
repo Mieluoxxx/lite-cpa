@@ -277,12 +277,70 @@ func executeClaudeStream(ctx context.Context, key registry.UpstreamKey, from, to
 	return streamSSE(ctx, resp, from, to, model, original, body), nil
 }
 
+// ExecuteImage forwards an OpenAI Images API request verbatim to an upstream
+// that already speaks the standard Images API (/v1/images/generations,
+// /v1/images/edits). No translation is applied: the original body — JSON or
+// multipart — and its Content-Type are passed through unchanged so multipart
+// edits (with image/mask files and a boundary) reach the upstream intact.
+// imageEndpoint is "generations" or "edits".
+func ExecuteImage(ctx context.Context, key registry.UpstreamKey, payload []byte, contentType, imageEndpoint string, stream bool) (any, error) {
+	url := strings.TrimSuffix(key.BaseURL, "/") + "/images/" + imageEndpoint
+	if stream {
+		resp, err := doRaw(ctx, key, url, payload, contentType, true)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			data, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, StatusError{Code: resp.StatusCode, Body: string(data)}
+		}
+		return streamPassthrough(ctx, resp)
+	}
+	resp, err := doRaw(ctx, key, url, payload, contentType, false)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, StatusError{Code: resp.StatusCode, Body: string(data)}
+	}
+	return &Result{Status: resp.StatusCode, Headers: resp.Header.Clone(), Body: data}, nil
+}
+
 func doJSON(ctx context.Context, key registry.UpstreamKey, url string, body []byte, stream bool) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if key.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+key.APIKey)
+	}
+	if stream {
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Cache-Control", "no-cache")
+	}
+	applyCustomHeaders(req, key.Headers)
+	return httpx.Do(ctx, httpx.Client(key.ProxyURL), req)
+}
+
+// doRaw is like doJSON but preserves the caller's Content-Type. Image edits are
+// uploaded as multipart/form-data, whose boundary must travel to the upstream
+// unchanged; doJSON hard-codes application/json and would break those uploads.
+func doRaw(ctx context.Context, key registry.UpstreamKey, url string, body []byte, contentType string, stream bool) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	req.Header.Set("Content-Type", contentType)
 	if key.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+key.APIKey)
 	}

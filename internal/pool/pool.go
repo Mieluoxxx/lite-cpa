@@ -57,6 +57,19 @@ func BuildRegistry(cfg *config.Config) *registry.Registry {
 			}, keysForModel(keys, m.Name))
 		}
 	}
+	for i, p := range cfg.OpenAIImages {
+		name := providerName(p.Name, "image", i)
+		keys := expandProvider("openai-image", name, p.BaseURL, p.APIKey, p.ProxyURL, p.Priority, p.Headers, p.Speed, p.APIKeyEntries, cfg.ProxyURL, p.FailoverMode)
+		for _, m := range p.Models {
+			alias := m.ResolvedAlias()
+			if alias == "" {
+				continue
+			}
+			r.RegisterModel(alias, &registry.ModelInfo{
+				ID: alias, Created: now, Type: "openai-image",
+			}, keysForModel(keys, m.Name))
+		}
+	}
 	return r
 }
 

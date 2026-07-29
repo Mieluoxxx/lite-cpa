@@ -38,6 +38,7 @@ type Config struct {
 	AnthropicMessages []Provider `yaml:"anthropic-messages"`
 	OpenAIResponses   []Provider `yaml:"openai-responses"`
 	OpenAICompletions []Provider `yaml:"openai-completions"`
+	OpenAIImages      []Provider `yaml:"openai-images"`
 }
 
 // ChannelAffinityKeySource extracts a sticky identity from the request.

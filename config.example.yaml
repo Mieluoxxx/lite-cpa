@@ -95,3 +95,16 @@ request-log:
 #     models:
 #       - name: "deepseek-chat"
 #         alias: "deepseek-chat"
+#
+# openai-images:
+#   # Upstream already speaks the standard OpenAI Images API
+#   # (/v1/images/generations, /v1/images/edits). lite-cpa forwards the request
+#   # verbatim — JSON or multipart, no translation — and reuses the selector,
+#   # affinity, retry, request-log and token-usage plumbing. Use a higher
+#   # max-body-bytes if you proxy large multi-image edits.
+#   - name: "xtoken-image"
+#     base-url: "https://api.xtokenmirror.com/v1"
+#     api-key: "sk-xtoken-key"
+#     models:
+#       - name: "gpt-image-2"
+#         alias: "gpt-image-2"
