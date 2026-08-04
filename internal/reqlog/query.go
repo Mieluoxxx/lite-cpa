@@ -11,6 +11,7 @@ type ListFilter struct {
 	Model      string
 	Upstream   string
 	Protocol   string
+	Status     string // "2xx", "4xx", "5xx", etc.
 	ErrorsOnly bool
 }
 

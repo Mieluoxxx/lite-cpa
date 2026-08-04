@@ -97,6 +97,7 @@ func logListFilter(q url.Values) reqlog.ListFilter {
 		Model:      strings.TrimSpace(q.Get("model")),
 		Upstream:   strings.TrimSpace(q.Get("upstream")),
 		Protocol:   strings.TrimSpace(q.Get("protocol")),
+		Status:     strings.TrimSpace(q.Get("status")),
 		ErrorsOnly: truthy(q.Get("errors")),
 	}
 }

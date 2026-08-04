@@ -3,13 +3,12 @@ import {
   ChevronRight,
   KeyRound,
   Moon,
-  RefreshCw,
   Search,
   Sun,
   Trash2,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -30,7 +29,12 @@ type Stats = {
   output_tokens: number
   cached_tokens: number
   cache_hit_rate: number
+  avg_duration_ms: number
+  output_tps: number
   by_model: NameCount[]
+  by_upstream: NameCount[]
+  by_status: NameCount[]
+  by_protocol: NameCount[]
 }
 
 type RequestLog = {
@@ -65,6 +69,7 @@ type Filters = {
   model: string
   upstream: string
   protocol: string
+  status: string
   errorsOnly: boolean
 }
 
@@ -108,6 +113,7 @@ function appendLogFilters(query: URLSearchParams, filters: Filters): void {
   if (filters.model) query.set('model', filters.model)
   if (filters.upstream) query.set('upstream', filters.upstream)
   if (filters.protocol) query.set('protocol', filters.protocol)
+  if (filters.status) query.set('status', filters.status)
   if (filters.errorsOnly) query.set('errors', '1')
 }
 
@@ -175,11 +181,12 @@ function App() {
   const [theme, setTheme] = useState<Theme>(savedTheme)
   const [stats, setStats] = useState<Stats | null>(null)
   const [logs, setLogs] = useState<LogList>({ items: [], total: 0, limit: PAGE_SIZE, offset: 0 })
-  const [filters, setFilters] = useState<Filters>({ model: '', upstream: '', protocol: '', errorsOnly: false })
+  const [filters, setFilters] = useState<Filters>({ model: '', upstream: '', protocol: '', status: '', errorsOnly: false })
   const [modelOptions, setModelOptions] = useState<string[]>([])
+  const [upstreamOptions, setUpstreamOptions] = useState<string[]>([])
+  const [statusOptions, setStatusOptions] = useState<string[]>([])
   const [draftFilters, setDraftFilters] = useState<Filters>(filters)
   const [isLoading, setIsLoading] = useState(true)
-  const [autoRefresh, setAutoRefresh] = useState(true)
   const [status, setStatus] = useState('正在加载请求日志…')
   const [apiKeyOpen, setAPIKeyOpen] = useState(false)
   const [apiKey, setAPIKey] = useState(savedAPIKey)
@@ -192,9 +199,13 @@ function App() {
     localStorage.setItem(THEME_STORAGE, theme)
   }, [theme])
 
-  const load = useCallback(async (offset = logs.offset) => {
+  // Track current offset so pagination clicks don't fight with filter-reset effects.
+  const offsetRef = useRef(0)
+
+  const load = useCallback(async (offset?: number) => {
+    const actual = offset ?? offsetRef.current
     setIsLoading(true)
-    const listQuery = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(offset) })
+    const listQuery = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(actual) })
     const statsQuery = new URLSearchParams()
     appendLogFilters(listQuery, filters)
     appendLogFilters(statsQuery, filters)
@@ -216,7 +227,34 @@ function App() {
         }
         return changed ? [...names].sort((a, b) => a.localeCompare(b)) : current
       })
+      setUpstreamOptions((current) => {
+        const names = new Set(current)
+        let changed = false
+        for (const { name } of nextStats.by_upstream) {
+          if (name && !names.has(name)) {
+            names.add(name)
+            changed = true
+          }
+        }
+        return changed ? [...names].sort((a, b) => a.localeCompare(b)) : current
+      })
+      setStatusOptions((current) => {
+        const codes = new Set(current)
+        let changed = false
+        for (const { name } of nextStats.by_status) {
+          // Group status codes into "2xx", "4xx", "5xx" etc.
+          if (name) {
+            const group = name[0] + 'xx'
+            if (!codes.has(group)) {
+              codes.add(group)
+              changed = true
+            }
+          }
+        }
+        return changed ? [...codes].sort() : current
+      })
       setLogs(nextLogs)
+      offsetRef.current = nextLogs.offset
       setStatus(nextStats.enabled ? `已启用 · 更新于 ${new Date().toLocaleTimeString()}` : 'request-log 未启用')
     } catch (error) {
       if (error instanceof APIError && error.status === 401) {
@@ -228,21 +266,30 @@ function App() {
     } finally {
       setIsLoading(false)
     }
-  }, [filters, logs.offset])
+  }, [filters])
 
   useEffect(() => {
+    offsetRef.current = 0
     void load(0)
   }, [filters, load])
 
+  // Auto-refresh every 5 seconds.
   useEffect(() => {
-    if (!autoRefresh) return undefined
     const timer = window.setInterval(() => void load(), 5000)
     return () => window.clearInterval(timer)
-  }, [autoRefresh, load])
+  }, [load])
 
   const models = modelOptions.includes(draftFilters.model) || !draftFilters.model
     ? modelOptions
     : [...modelOptions, draftFilters.model].sort((a, b) => a.localeCompare(b))
+
+  const upstreams = upstreamOptions.includes(draftFilters.upstream) || !draftFilters.upstream
+    ? upstreamOptions
+    : [...upstreamOptions, draftFilters.upstream].sort((a, b) => a.localeCompare(b))
+
+  const statuses = statusOptions.length > 0
+    ? statusOptions
+    : []
 
   const currentFrom = logs.total === 0 ? 0 : logs.offset + 1
   const currentTo = Math.min(logs.offset + logs.items.length, logs.total)
@@ -325,14 +372,22 @@ function App() {
               </Button>
             </div>
 
-            <form className="glass-divider grid gap-3 border-b p-5 sm:grid-cols-2 lg:grid-cols-[minmax(10rem,1fr)_minmax(10rem,1fr)_9rem_auto_auto_auto] lg:items-center sm:px-6" onSubmit={applyFilters}>
+            <form className="glass-divider grid gap-3 border-b p-5 sm:grid-cols-2 lg:grid-cols-[minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(8rem,1fr)_9rem_auto_auto] lg:items-center sm:px-6" onSubmit={applyFilters}>
               <label className="sr-only" htmlFor="model">模型</label>
               <select id="model" className="glass-select w-full px-3 text-sm text-foreground outline-none" value={draftFilters.model} onChange={(event) => setDraftFilters((value) => ({ ...value, model: event.target.value }))}>
                 <option value="">所有模型</option>
                 {models.map((model) => <option key={model} value={model}>{model}</option>)}
               </select>
               <label className="sr-only" htmlFor="upstream">上游</label>
-              <Input className="glass-input" id="upstream" value={draftFilters.upstream} placeholder="上游名称" onChange={(event) => setDraftFilters((value) => ({ ...value, upstream: event.target.value }))} />
+              <select id="upstream" className="glass-select w-full px-3 text-sm text-foreground outline-none" value={draftFilters.upstream} onChange={(event) => setDraftFilters((value) => ({ ...value, upstream: event.target.value }))}>
+                <option value="">所有上游</option>
+                {upstreams.map((upstream) => <option key={upstream} value={upstream}>{upstream}</option>)}
+              </select>
+              <label className="sr-only" htmlFor="status">状态码</label>
+              <select id="status" className="glass-select w-full px-3 text-sm text-foreground outline-none" value={draftFilters.status} onChange={(event) => setDraftFilters((value) => ({ ...value, status: event.target.value }))}>
+                <option value="">所有状态码</option>
+                {statuses.map((status) => <option key={status} value={status}>{status}</option>)}
+              </select>
               <label className="sr-only" htmlFor="protocol">协议</label>
               <select id="protocol" className="glass-select w-full px-3 text-sm text-foreground outline-none" value={draftFilters.protocol} onChange={(event) => setDraftFilters((value) => ({ ...value, protocol: event.target.value }))}>
                 <option value="">所有协议</option>
@@ -345,11 +400,6 @@ function App() {
                 仅错误
               </label>
               <Button className="min-h-10 sm:min-h-10" type="submit"><Search /> 筛选</Button>
-              <Button className="min-h-10 sm:min-h-10" variant="outline" aria-label="刷新日志" loading={isLoading} onClick={() => void load(0)}><RefreshCw /> 刷新</Button>
-              <label className="flex min-h-10 cursor-pointer items-center gap-2 whitespace-nowrap px-1 text-sm text-muted-foreground">
-                <input type="checkbox" checked={autoRefresh} onChange={(event) => setAutoRefresh(event.target.checked)} />
-                自动刷新
-              </label>
             </form>
 
             <div className="overflow-x-auto">
