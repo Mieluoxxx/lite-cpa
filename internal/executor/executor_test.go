@@ -1,14 +1,19 @@
 package executor
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/Mieluoxxx/lite-cpa/internal/registry"
+	"github.com/Mieluoxxx/lite-cpa/internal/translator"
 	"github.com/tidwall/gjson"
 )
 
-func TestApplyProviderSpeed(t *testing.T) {
+func TestApplySpeed(t *testing.T) {
 	tests := []struct {
 		name       string
 		key        registry.UpstreamKey
@@ -63,7 +68,7 @@ func TestApplyProviderSpeed(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotKey, gotBody := applyProviderSpeed(tt.key, []byte(tt.body))
+			gotKey, gotBody := applySpeed(tt.key, []byte(tt.body))
 			value := gjson.GetBytes(gotBody, tt.wantPath)
 			if tt.wantValue == "" {
 				if value.Exists() {
@@ -123,5 +128,143 @@ func TestSemanticSSEError(t *testing.T) {
 				t.Fatalf("semanticSSEError() = %q, want containing %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestApplyModelVerbosity(t *testing.T) {
+	tests := []struct {
+		name      string
+		to        translator.Format
+		verbosity string
+		body      string
+		want      string // "" = absent
+	}{
+		{
+			name:      "responses upstream injects low",
+			to:        translator.FormatOpenAIResponse,
+			verbosity: "low",
+			body:      `{"model":"gpt-5.6-luna","input":"hi"}`,
+			want:      "low",
+		},
+		{
+			name:      "responses upstream injects high",
+			to:        translator.FormatOpenAIResponse,
+			verbosity: "high",
+			body:      `{"model":"gpt-5.6-sol","input":"hi"}`,
+			want:      "high",
+		},
+		{
+			name:      "client text.verbosity wins",
+			to:        translator.FormatOpenAIResponse,
+			verbosity: "low",
+			body:      `{"model":"gpt-5.6-luna","text":{"verbosity":"high"},"input":"hi"}`,
+			want:      "high",
+		},
+		{
+			name:      "empty verbosity leaves body unchanged",
+			to:        translator.FormatOpenAIResponse,
+			verbosity: "",
+			body:      `{"model":"gpt-5.6-luna","input":"hi"}`,
+			want:      "",
+		},
+		{
+			name:      "chat completions upstream ignores verbosity",
+			to:        translator.FormatOpenAI,
+			verbosity: "low",
+			body:      `{"model":"deepseek-v4-flash","messages":[]}`,
+			want:      "",
+		},
+		{
+			name:      "claude upstream ignores verbosity",
+			to:        translator.FormatClaude,
+			verbosity: "low",
+			body:      `{"model":"claude-sonnet-4","messages":[]}`,
+			want:      "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := applyModelVerbosity(tt.to, tt.verbosity, []byte(tt.body))
+			value := gjson.GetBytes(got, "text.verbosity")
+			if tt.want == "" {
+				if value.Exists() {
+					t.Fatalf("text.verbosity = %q, want absent; body=%s", value.String(), got)
+				}
+			} else if value.String() != tt.want {
+				t.Fatalf("text.verbosity = %q, want %q; body=%s", value.String(), tt.want, got)
+			}
+		})
+	}
+}
+
+func TestExecuteResponsesInjectsModelVerbosity(t *testing.T) {
+	baseKey := registry.UpstreamKey{
+		Provider:  "openai-response",
+		APIKey:    "sk-test",
+		Verbosity: "low",
+	}
+
+	run := func(t *testing.T, key registry.UpstreamKey, payload []byte, stream bool) []byte {
+		var gotBody []byte
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/responses" {
+				t.Errorf("upstream path = %q, want /responses", r.URL.Path)
+			}
+			gotBody, _ = io.ReadAll(r.Body)
+			if stream {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n"))
+			} else {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","model":"gpt-5.6-luna","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}]}`))
+			}
+		}))
+		defer srv.Close()
+		key.BaseURL = srv.URL
+
+		res, err := Execute(context.Background(), key, "gpt-5.6-luna", translator.FormatOpenAIResponse, payload, stream)
+		if err != nil {
+			t.Fatalf("Execute(stream=%v): %v", stream, err)
+		}
+		if stream {
+			for ch := range res.(*StreamResult).Chunks {
+				if ch.Err != nil {
+					t.Fatalf("stream chunk error: %v", ch.Err)
+				}
+			}
+		}
+		return gotBody
+	}
+
+	// Configured low -> text.verbosity: low, non-stream.
+	body := run(t, baseKey, []byte(`{"model":"gpt-5.6-luna","input":"hi"}`), false)
+	if got := gjson.GetBytes(body, "text.verbosity").String(); got != "low" {
+		t.Fatalf("non-stream verbosity = %q, want low; body=%s", got, body)
+	}
+	if got := gjson.GetBytes(body, "stream").Bool(); got {
+		t.Fatalf("non-stream should carry stream=false; body=%s", body)
+	}
+
+	// Configured low -> text.verbosity: low, streaming.
+	body = run(t, baseKey, []byte(`{"model":"gpt-5.6-luna","input":"hi"}`), true)
+	if got := gjson.GetBytes(body, "text.verbosity").String(); got != "low" {
+		t.Fatalf("stream verbosity = %q, want low; body=%s", got, body)
+	}
+	if got := gjson.GetBytes(body, "stream").Bool(); !got {
+		t.Fatalf("stream should carry stream=true; body=%s", body)
+	}
+
+	// Explicit client text.verbosity always wins.
+	body = run(t, baseKey, []byte(`{"model":"gpt-5.6-luna","text":{"verbosity":"high"},"input":"hi"}`), false)
+	if got := gjson.GetBytes(body, "text.verbosity").String(); got != "high" {
+		t.Fatalf("client verbosity = %q, want high preserved; body=%s", got, body)
+	}
+
+	// Unconfigured model stays untouched.
+	noVerb := baseKey
+	noVerb.Verbosity = ""
+	body = run(t, noVerb, []byte(`{"model":"grok-4.5","input":"hi"}`), false)
+	if got := gjson.GetBytes(body, "text.verbosity"); got.Exists() {
+		t.Fatalf("unconfigured model must not get verbosity; body=%s", body)
 	}
 }

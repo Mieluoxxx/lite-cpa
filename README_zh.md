@@ -149,20 +149,38 @@ openai-completions:
 未配置 `headers.User-Agent` 时，Go 默认发送 `Go-http-client/1.1`。
 
 
-### Provider Fast 模式
+### 模型 Fast 模式
 
-`speed: fast` 是仅由管理员配置的 provider 策略，会作用于该 provider 的每一次请求：Anthropic 上游会收到 `speed: "fast"` 与 `Anthropic-Beta: fast-mode-2026-02-01`；OpenAI 上游会收到 `service_tier: "priority"`。未配置时，lite-cpa 会移除客户端携带的 fast tier 字段，客户端不能自行改变速度或计费。只应在确认上游支持其原生 fast tier 时配置。
+`speed: fast` 是模型级策略：Anthropic 上游会收到 `speed: "fast"` 与 `Anthropic-Beta: fast-mode-2026-02-01`；OpenAI 上游会收到 `service_tier: "priority"`。某模型未配置时，lite-cpa 会移除客户端携带的 fast tier 字段，客户端不能自行改变速度或计费。只应在确认上游支持其原生 fast tier 时配置。
 
 ```yaml
 anthropic-messages:
   - name: anthropic-fast
-    speed: fast
+    models:
+      - name: claude-sonnet-4
+        speed: fast
     # ...
 
 openai-responses:
   - name: openai-fast
-    speed: fast
+    models:
+      - name: gpt-5
+        speed: fast
     # ...
+```
+
+### 模型 verbosity
+
+`verbosity` 是 GPT-5 系列的模型级提示参数，可在不改动 prompt 的前提下控制回复篇幅。当客户端未设置时，lite-cpa 会以 `text.verbosity` 注入到 Responses API 请求中；客户端已设置的 `text.verbosity` 始终优先。在 `openai-response` 上游的 `models` 下配置：
+
+```yaml
+openai-responses:
+  - name: isok
+    base-url: https://ai.isok.dev/v1
+    api-key: sk-...
+    models:
+      - name: gpt-5.6-luna
+        verbosity: low   # low | medium | high
 ```
 
 ### 故障切换模式

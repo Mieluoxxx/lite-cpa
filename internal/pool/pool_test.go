@@ -167,3 +167,41 @@ func TestExpandStoresProviderAndEntryPriority(t *testing.T) {
 		t.Fatalf("sk-b = %+v, want provider 3 entry 0", got)
 	}
 }
+
+func TestModelSpeedVerbosityPropagateToKeys(t *testing.T) {
+	cfg := &config.Config{
+		OpenAIResponses: []config.Provider{
+			{
+				Name:     "isok",
+				Priority: 0,
+				BaseURL:  "https://isok.example",
+				APIKey:   "sk-a",
+				Models: []config.ModelAlias{
+					{Name: "gpt-5.6-luna", Speed: "fast", Verbosity: "low"},
+					{Name: "gpt-5.6-sol", Speed: "fast", Verbosity: "high"},
+					{Name: "gpt-5.6-terra", Verbosity: "low"},
+					{Name: "grok-4.5"},
+				},
+			},
+		},
+	}
+	reg := pool.BuildRegistry(cfg)
+
+	cases := map[string]struct{ speed, verbosity string }{
+		"gpt-5.6-luna":  {"fast", "low"},
+		"gpt-5.6-sol":   {"fast", "high"},
+		"gpt-5.6-terra": {"", "low"},
+		"grok-4.5":      {"", ""},
+	}
+	for alias, want := range cases {
+		_, keys, ok := reg.Resolve(alias)
+		if !ok || len(keys) == 0 {
+			t.Fatalf("resolve %s: ok=%v keys=%d", alias, ok, len(keys))
+		}
+		for _, k := range keys {
+			if k.Speed != want.speed || k.Verbosity != want.verbosity {
+				t.Fatalf("%s key speed=%q verbosity=%q, want speed=%q verbosity=%q", alias, k.Speed, k.Verbosity, want.speed, want.verbosity)
+			}
+		}
+	}
+}

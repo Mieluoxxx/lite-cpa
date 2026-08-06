@@ -76,7 +76,8 @@ func Execute(ctx context.Context, key registry.UpstreamKey, upstreamModel string
 	if err != nil {
 		return nil, err
 	}
-	key, translated = applyProviderSpeed(key, translated)
+	key, translated = applySpeed(key, translated)
+	translated = applyModelVerbosity(to, key.Verbosity, translated)
 
 	switch key.Provider {
 	case "openai":
@@ -99,9 +100,11 @@ func Execute(ctx context.Context, key registry.UpstreamKey, upstreamModel string
 	}
 }
 
-// applyProviderSpeed keeps fast-tier billing under provider administrator control.
-// Provider speed overrides the client request; without it, client-selected fast tiers are removed.
-func applyProviderSpeed(key registry.UpstreamKey, body []byte) (registry.UpstreamKey, []byte) {
+// applySpeed enforces the model-level fast tier. Configured "fast" injects the
+// native tier (Anthropic speed + fast-mode beta, OpenAI service_tier priority);
+// without it, client-selected fast-tier fields are removed so clients cannot
+// change speed or billing.
+func applySpeed(key registry.UpstreamKey, body []byte) (registry.UpstreamKey, []byte) {
 	switch key.Provider {
 	case "claude":
 		body, _ = sjson.DeleteBytes(body, "speed")
@@ -116,6 +119,20 @@ func applyProviderSpeed(key registry.UpstreamKey, body []byte) (registry.Upstrea
 		}
 	}
 	return key, body
+}
+
+// applyModelVerbosity injects a configured model-level verbosity hint (low|medium|high)
+// as text.verbosity in Responses requests. Only openai-response upstreams accept it;
+// a client-set text.verbosity always wins (no overwrite).
+func applyModelVerbosity(to translator.Format, verbosity string, body []byte) []byte {
+	if to != translator.FormatOpenAIResponse || verbosity == "" {
+		return body
+	}
+	if gjson.GetBytes(body, "text.verbosity").Exists() {
+		return body
+	}
+	body, _ = sjson.SetBytes(body, "text.verbosity", verbosity)
+	return body
 }
 
 func appendHeaderToken(headers map[string]string, name, token string) map[string]string {

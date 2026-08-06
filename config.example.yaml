@@ -31,9 +31,35 @@ request-log:
   #   dsn: "postgres://litecpa:litecpa@postgres:5432/litecpa?sslmode=disable"
 
 # Provider field order / 字段顺序:
-#   name → proxy-url → priority → failover-mode → headers → speed → base-url → api-key → models
-# speed: fast is administrator-only. Anthropic adds speed + fast-mode beta; OpenAI adds service_tier: priority.
-# Unset blocks client-selected fast tiers. Configure only against upstreams that support their native fast tier.
+#   name → proxy-url → priority → failover-mode → headers → base-url → api-key → models
+# Model-scoped: models[].speed: fast (Anthropic adds speed + fast-mode beta; OpenAI adds service_tier: priority)
+# and models[].verbosity: low|medium|high (injected as text.verbosity). Unset blocks client-selected fast tiers.
+# Configure only against upstreams that support their native fast tier.
+
+# --- Model verbosity (GPT-5 series / Responses API) ---
+# Controls reply length without touching the prompt. Injected as text.verbosity
+# when the client did not set it; a client-set value wins. Values: low|medium|high.
+# 控制回复篇幅而不改动 prompt；客户端未设置时注入 text.verbosity，已设置则优先。
+# 取值 low | medium | high，仅对 openai-response 上游生效。
+# openai-responses:
+#   - name: "isok"
+#     failover-mode: "provider"          # relay: one site down => skip all its keys
+#     base-url: "https://ai.isok.dev/v1"
+#     api-key-entries:
+#       - api-key: "sk-your-relay-key"
+#     models:
+#       - name: "gpt-5.6-luna"
+#         alias: "gpt-5.6-luna"
+#         speed: "fast"                  # model-scoped fast tier (service_tier: priority)
+#         verbosity: "low"               # low -> 精简 | medium -> 平衡 | high -> 详细
+#       - name: "gpt-5.6-terra"
+#         alias: "gpt-5.6-terra"
+#         speed: "fast"
+#         verbosity: "low"
+#       - name: "gpt-5.6-sol"
+#         alias: "gpt-5.6-sol"
+#         speed: "fast"
+#         verbosity: "low"
 
 # anthropic-messages:
 #   - name: "anthropic-official"
@@ -42,7 +68,6 @@ request-log:
 #     failover-mode: "key"
 #     headers:
 #       User-Agent: "claude-cli/2.1.63 (external, cli)"
-#     speed: "fast"
 #     base-url: "https://api.anthropic.com"
 #     api-key: "sk-ant-your-key"
 #     models:
@@ -56,12 +81,12 @@ request-log:
 #     failover-mode: "key"
 #     headers:
 #       User-Agent: "codex_cli_rs/0.144.1"
-#     speed: "fast"
 #     base-url: "https://api.openai.com/v1"
 #     api-key: "sk-openai-official-key"
 #     models:
 #       - name: "gpt-5"
 #         alias: "gpt-5"
+#         speed: "fast"
 #
 #   - name: "laysath"
 #     proxy-url: ""
@@ -69,7 +94,6 @@ request-log:
 #     failover-mode: "provider"
 #     headers:
 #       User-Agent: "codex_cli_rs/0.144.1"
-#     speed: "fast"
 #     base-url: "https://ai.laysath.cn/v1"
 #     api-key-entries:
 #       - api-key: "sk-laysath-1"
@@ -79,6 +103,7 @@ request-log:
 #     models:
 #       - name: "gpt-5"
 #         alias: "gpt-5"
+#         speed: "fast"
 #       - name: "grok-4.5"
 #         alias: "grok-4.5"
 
@@ -89,7 +114,6 @@ request-log:
 #     failover-mode: "key"
 #     headers:
 #       User-Agent: "curl/8.7.1"
-#     speed: "fast"
 #     base-url: "https://api.deepseek.com/v1"
 #     api-key: "sk-deepseek-key"
 #     models:

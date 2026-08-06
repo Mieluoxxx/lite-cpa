@@ -18,7 +18,7 @@ func BuildRegistry(cfg *config.Config) *registry.Registry {
 
 	for i, p := range cfg.AnthropicMessages {
 		name := providerName(p.Name, "anthropic", i)
-		keys := expandProvider("claude", name, p.BaseURL, p.APIKey, p.ProxyURL, p.Priority, p.Headers, p.Speed, p.APIKeyEntries, cfg.ProxyURL, p.FailoverMode)
+		keys := expandProvider("claude", name, p.BaseURL, p.APIKey, p.ProxyURL, p.Priority, p.Headers, p.APIKeyEntries, cfg.ProxyURL, p.FailoverMode)
 		for _, m := range p.Models {
 			alias := m.ResolvedAlias()
 			if alias == "" {
@@ -26,13 +26,13 @@ func BuildRegistry(cfg *config.Config) *registry.Registry {
 			}
 			r.RegisterModel(alias, &registry.ModelInfo{
 				ID: alias, Created: now, Type: "claude",
-			}, keysForModel(keys, m.Name))
+			}, keysForModel(keys, m.Name, m.ResolvedSpeed(), m.ResolvedVerbosity()))
 		}
 	}
 
 	for i, p := range cfg.OpenAIResponses {
 		name := providerName(p.Name, "responses", i)
-		keys := expandProvider("openai-response", name, p.BaseURL, p.APIKey, p.ProxyURL, p.Priority, p.Headers, p.Speed, p.APIKeyEntries, cfg.ProxyURL, p.FailoverMode)
+		keys := expandProvider("openai-response", name, p.BaseURL, p.APIKey, p.ProxyURL, p.Priority, p.Headers, p.APIKeyEntries, cfg.ProxyURL, p.FailoverMode)
 		for _, m := range p.Models {
 			alias := m.ResolvedAlias()
 			if alias == "" {
@@ -40,13 +40,13 @@ func BuildRegistry(cfg *config.Config) *registry.Registry {
 			}
 			r.RegisterModel(alias, &registry.ModelInfo{
 				ID: alias, Created: now, Type: "openai-response",
-			}, keysForModel(keys, m.Name))
+			}, keysForModel(keys, m.Name, m.ResolvedSpeed(), m.ResolvedVerbosity()))
 		}
 	}
 
 	for i, p := range cfg.OpenAICompletions {
 		name := providerName(p.Name, "compat", i)
-		keys := expandProvider("openai", name, p.BaseURL, p.APIKey, p.ProxyURL, p.Priority, p.Headers, p.Speed, p.APIKeyEntries, cfg.ProxyURL, p.FailoverMode)
+		keys := expandProvider("openai", name, p.BaseURL, p.APIKey, p.ProxyURL, p.Priority, p.Headers, p.APIKeyEntries, cfg.ProxyURL, p.FailoverMode)
 		for _, m := range p.Models {
 			alias := m.ResolvedAlias()
 			if alias == "" {
@@ -54,12 +54,12 @@ func BuildRegistry(cfg *config.Config) *registry.Registry {
 			}
 			r.RegisterModel(alias, &registry.ModelInfo{
 				ID: alias, Created: now, Type: "openai",
-			}, keysForModel(keys, m.Name))
+			}, keysForModel(keys, m.Name, m.ResolvedSpeed(), m.ResolvedVerbosity()))
 		}
 	}
 	for i, p := range cfg.OpenAIImages {
 		name := providerName(p.Name, "image", i)
-		keys := expandProvider("openai-image", name, p.BaseURL, p.APIKey, p.ProxyURL, p.Priority, p.Headers, p.Speed, p.APIKeyEntries, cfg.ProxyURL, p.FailoverMode)
+		keys := expandProvider("openai-image", name, p.BaseURL, p.APIKey, p.ProxyURL, p.Priority, p.Headers, p.APIKeyEntries, cfg.ProxyURL, p.FailoverMode)
 		for _, m := range p.Models {
 			alias := m.ResolvedAlias()
 			if alias == "" {
@@ -67,7 +67,7 @@ func BuildRegistry(cfg *config.Config) *registry.Registry {
 			}
 			r.RegisterModel(alias, &registry.ModelInfo{
 				ID: alias, Created: now, Type: "openai-image",
-			}, keysForModel(keys, m.Name))
+			}, keysForModel(keys, m.Name, m.ResolvedSpeed(), m.ResolvedVerbosity()))
 		}
 	}
 	return r
@@ -81,7 +81,7 @@ func providerName(name, fallbackPrefix string, index int) string {
 	return fmt.Sprintf("%s-%d", fallbackPrefix, index)
 }
 
-func expandProvider(provider, name, baseURL, flatKey, flatProxy string, flatPriority int, headers map[string]string, speed string, entries []config.APIKeyEntry, globalProxy, failoverMode string) []registry.UpstreamKey {
+func expandProvider(provider, name, baseURL, flatKey, flatProxy string, flatPriority int, headers map[string]string, entries []config.APIKeyEntry, globalProxy, failoverMode string) []registry.UpstreamKey {
 	baseURL = trimSlash(baseURL)
 	failoverMode = config.NormalizeFailoverMode(failoverMode)
 	expanded := config.ExpandKeys(flatKey, entries)
@@ -104,7 +104,6 @@ func expandProvider(provider, name, baseURL, flatKey, flatProxy string, flatPrio
 			APIKey:        e.APIKey,
 			Priority:      flatPriority,
 			EntryPriority: e.Priority,
-			Speed:         speed,
 			Headers:       h,
 			ProxyURL:      proxy,
 			FailoverMode:  failoverMode,
@@ -113,12 +112,14 @@ func expandProvider(provider, name, baseURL, flatKey, flatProxy string, flatPrio
 	return out
 }
 
-func keysForModel(keys []registry.UpstreamKey, upstreamModel string) []registry.UpstreamKey {
+func keysForModel(keys []registry.UpstreamKey, upstreamModel, speed, verbosity string) []registry.UpstreamKey {
 	// Attach upstream model name into a copy via ID suffix is not needed;
 	// handlers resolve alias separately. Store upstream model in a synthetic header.
 	out := make([]registry.UpstreamKey, len(keys))
 	for i, k := range keys {
 		out[i] = k
+		out[i].Speed = speed
+		out[i].Verbosity = verbosity
 		if out[i].Headers == nil {
 			out[i].Headers = map[string]string{}
 		} else {

@@ -45,8 +45,7 @@ func TestChatCompletionsToOpenAIUpstream(t *testing.T) {
 			Name:    "mock",
 			BaseURL: up.URL,
 			APIKey:  "sk-up",
-			Speed:   "fast",
-			Models:  []config.ModelAlias{{Name: "mock-model", Alias: "mock-model"}},
+			Models:  []config.ModelAlias{{Name: "mock-model", Alias: "mock-model", Speed: "fast"}},
 		}},
 	}
 	srv := server.New(cfg, nil)
@@ -353,9 +352,8 @@ func TestOpenAIToAnthropicNonStream(t *testing.T) {
 		AnthropicMessages: []config.Provider{{
 			BaseURL: up.URL,
 			APIKey:  "sk-ant",
-			Speed:   "fast",
 			Headers: map[string]string{"anthropic-beta": "oauth-2025-04-20"},
-			Models:  []config.ModelAlias{{Name: "claude-sonnet-4", Alias: "claude-sonnet-4"}},
+			Models:  []config.ModelAlias{{Name: "claude-sonnet-4", Alias: "claude-sonnet-4", Speed: "fast"}},
 		}},
 	}
 	srv := server.New(cfg, nil)

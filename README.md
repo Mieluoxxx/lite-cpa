@@ -149,20 +149,38 @@ openai-completions:
 If `headers.User-Agent` is unset, Go sends the default `Go-http-client/1.1`.
 
 
-### Provider fast mode
+### Model fast mode
 
-`speed: fast` is an administrator-only provider policy. It applies to every request routed to that provider: Anthropic upstreams receive `speed: "fast"` and `Anthropic-Beta: fast-mode-2026-02-01`; OpenAI upstreams receive `service_tier: "priority"`. When omitted, lite-cpa removes client-supplied fast-tier fields, so clients cannot change speed or billing. Configure it only for upstreams that support their native fast tier.
+`speed: fast` is a per-model policy. Anthropic upstreams receive `speed: "fast"` and `Anthropic-Beta: fast-mode-2026-02-01`; OpenAI upstreams receive `service_tier: "priority"`. When omitted for a model, lite-cpa removes client-supplied fast-tier fields, so clients cannot change speed or billing. Configure it only for upstreams that support their native fast tier.
 
 ```yaml
 anthropic-messages:
   - name: anthropic-fast
-    speed: fast
+    models:
+      - name: claude-sonnet-4
+        speed: fast
     # ...
 
 openai-responses:
   - name: openai-fast
-    speed: fast
+    models:
+      - name: gpt-5
+        speed: fast
     # ...
+```
+
+### Model verbosity
+
+`verbosity` is a per-model hint for the GPT-5 series that controls reply length without touching the prompt. It is injected as `text.verbosity` into Responses API requests when the client did not set it; a client-set `text.verbosity` always wins. Configure it under `models` on `openai-response` upstreams:
+
+```yaml
+openai-responses:
+  - name: isok
+    base-url: https://ai.isok.dev/v1
+    api-key: sk-...
+    models:
+      - name: gpt-5.6-luna
+        verbosity: low   # low | medium | high
 ```
 
 ### Failover mode

@@ -34,7 +34,8 @@ type UpstreamKey struct {
 	APIKey        string
 	Priority      int    // provider-level priority (lower = higher); used across the merged model pool
 	EntryPriority int    // key-level priority within the same provider Name (lower = higher)
-	Speed         string // provider-controlled fast tier; empty blocks client-selected tiers
+	Speed         string // model-level fast tier; empty blocks client-selected tiers
+	Verbosity     string // model-level Responses hint (low|medium|high) injected as text.verbosity
 	Headers       map[string]string
 	ProxyURL      string
 	FailoverMode  string // key | provider (from provider config)

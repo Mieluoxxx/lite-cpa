@@ -81,10 +81,9 @@ Three lists (same `Provider` shape):
 3. `priority`
 4. `failover-mode`
 5. `headers`
-6. `speed`
-7. `base-url`
-8. `api-key` and/or `api-key-entries`
-9. `models`
+6. `base-url`
+7. `api-key` and/or `api-key-entries`
+8. `models`
 
 #### Field reference
 
@@ -95,12 +94,13 @@ Three lists (same `Provider` shape):
 | `priority` | provider | Cross-provider rank in a merged model pool. Lower number = higher priority. |
 | `failover-mode` | provider | `key` (default) or `provider`. See [Failover](#failover). |
 | `headers` | provider | Extra upstream headers. `User-Agent` recommended; unset → Go default `Go-http-client/1.1`. |
-| `speed` | provider | Optional `fast` only. Administrator-controlled: Anthropic sends `speed: "fast"` plus `fast-mode-2026-02-01`; OpenAI sends `service_tier: "priority"`. When absent, client-selected fast tiers are removed. Configure only for upstreams that support their native tier. |
 | `base-url` | provider | Upstream base (no trailing slash required). |
 | `api-key` | provider | Single key. Ignored if `api-key-entries` is non-empty. |
 | `api-key-entries[]` | provider | Multi-key pool: `api-key`, optional `priority` (provider-internal only). |
 | `api-key-entries[].priority` | entry | Rank **inside** this provider only. Lower number = preferred among this provider's keys. Does not outrank another provider. |
 | `models[]` | provider | `name` = upstream model id; `alias` = client-visible id (defaults to `name`). |
+| `models[].speed` | model | Optional `fast` only. Model-scoped: Anthropic sends `speed: "fast"` plus `fast-mode-2026-02-01`; OpenAI sends `service_tier: "priority"`. When absent, client-selected fast tiers are removed. Configure only for upstreams that support their native tier. |
+| `models[].verbosity` | model | Optional `low`/`medium`/`high` (GPT-5 series). Injected as `text.verbosity` into Responses API requests when the client did not set it; a client-set `text.verbosity` always wins. Ignored for non-`openai-response` upstreams. |
 
 #### Multi-provider same model
 

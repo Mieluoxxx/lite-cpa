@@ -116,14 +116,48 @@ openai-completions:
 	}
 }
 
-func TestProviderSpeedNormalizeAndValidate(t *testing.T) {
+func TestModelSpeedNormalizeAndValidate(t *testing.T) {
 	var cfg Config
 	raw := `
 port: 1
 api-keys: [k]
 openai-completions:
   - name: official
-    speed: " FAST "
+    base-url: http://x
+    api-key: a
+    models:
+      - name: m
+        speed: " FAST "
+      - name: m2
+`
+	if err := yaml.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults()
+	if got := cfg.OpenAICompletions[0].Models[0].ResolvedSpeed(); got != "fast" {
+		t.Fatalf("speed = %q, want fast", got)
+	}
+	if got := cfg.OpenAICompletions[0].Models[1].ResolvedSpeed(); got != "" {
+		t.Fatalf("unset speed = %q, want empty", got)
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate fast model speed: %v", err)
+	}
+
+	cfg.OpenAICompletions[0].Models[0].Speed = "turbo"
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "speed must be fast") {
+		t.Fatalf("validate invalid model speed = %v, want speed validation error", err)
+	}
+}
+
+func TestProviderSpeedMigrationError(t *testing.T) {
+	var cfg Config
+	raw := `
+port: 1
+api-keys: [k]
+openai-completions:
+  - name: legacy
+    speed: fast
     base-url: http://x
     api-key: a
     models: [{name: m}]
@@ -132,15 +166,46 @@ openai-completions:
 		t.Fatal(err)
 	}
 	cfg.applyDefaults()
-	if cfg.OpenAICompletions[0].Speed != "fast" {
-		t.Fatalf("speed = %q, want fast", cfg.OpenAICompletions[0].Speed)
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "no longer supported") {
+		t.Fatalf("validate provider-level speed = %v, want migration error", err)
 	}
+}
+
+func TestModelVerbosityNormalizeAndValidate(t *testing.T) {
+	var cfg Config
+	raw := `
+port: 1
+api-keys: [k]
+openai-responses:
+  - name: isok
+    base-url: http://x
+    api-key: a
+    models:
+      - name: gpt-5.6-luna
+        verbosity: " LOW "
+      - name: gpt-5.6-terra
+        verbosity: medium
+      - name: gpt-5.6-sol
+`
+	if err := yaml.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults()
 	if err := cfg.validate(); err != nil {
-		t.Fatalf("validate fast speed: %v", err)
+		t.Fatalf("validate valid verbosity: %v", err)
+	}
+	if got := cfg.OpenAIResponses[0].Models[0].ResolvedVerbosity(); got != "low" {
+		t.Fatalf("verbosity = %q, want low", got)
+	}
+	if got := cfg.OpenAIResponses[0].Models[1].ResolvedVerbosity(); got != "medium" {
+		t.Fatalf("verbosity = %q, want medium", got)
+	}
+	if got := cfg.OpenAIResponses[0].Models[2].ResolvedVerbosity(); got != "" {
+		t.Fatalf("unset verbosity = %q, want empty", got)
 	}
 
-	cfg.OpenAICompletions[0].Speed = "turbo"
-	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "speed must be fast") {
-		t.Fatalf("validate invalid speed = %v, want speed validation error", err)
+	cfg.OpenAIResponses[0].Models[0].Verbosity = "verbose"
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "verbosity must be low, medium or high") {
+		t.Fatalf("validate invalid verbosity = %v, want verbosity validation error", err)
 	}
 }

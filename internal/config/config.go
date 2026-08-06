@@ -211,7 +211,9 @@ type Provider struct {
 	// (useful for relay sites where all keys die together).
 	FailoverMode string            `yaml:"failover-mode,omitempty"`
 	Headers      map[string]string `yaml:"headers"`
-	// Speed forces the provider's supported fast tier. Empty prevents client-selected fast tiers.
+	// Speed is deprecated and no longer applied at provider level. Kept only as
+	// a parse sentinel so legacy configs fail validation with a migration error
+	// instead of silently losing the fast tier. Configure models[].speed instead.
 	Speed         string        `yaml:"speed,omitempty"`
 	BaseURL       string        `yaml:"base-url"`
 	APIKey        string        `yaml:"api-key"`
@@ -227,6 +229,12 @@ type APIKeyEntry struct {
 type ModelAlias struct {
 	Name  string `yaml:"name"`
 	Alias string `yaml:"alias"`
+	// Speed forces this model's supported fast tier ("fast"). Empty prevents
+	// client-selected fast tiers. Model-scoped, same level as Verbosity.
+	Speed string `yaml:"speed,omitempty"`
+	// Verbosity is an optional Responses-API hint injected as text.verbosity
+	// when the client did not set it (low | medium | high, GPT-5 series).
+	Verbosity string `yaml:"verbosity,omitempty"`
 }
 
 func Load(path string) (*Config, error) {
@@ -258,9 +266,9 @@ func (c *Config) applyDefaults() {
 	normalizeProviderFailovers(c.AnthropicMessages)
 	normalizeProviderFailovers(c.OpenAIResponses)
 	normalizeProviderFailovers(c.OpenAICompletions)
-	normalizeProviderSpeeds(c.AnthropicMessages)
-	normalizeProviderSpeeds(c.OpenAIResponses)
-	normalizeProviderSpeeds(c.OpenAICompletions)
+	normalizeModelSpeeds(c.AnthropicMessages)
+	normalizeModelSpeeds(c.OpenAIResponses)
+	normalizeModelSpeeds(c.OpenAICompletions)
 	if c.RequestLog.Backend == "" {
 		c.RequestLog.Backend = "sqlite"
 	}
@@ -404,12 +412,24 @@ func (c *Config) validate() error {
 				}
 				return fmt.Errorf("provider %q failover-mode must be key or provider, got %q", name, p.FailoverMode)
 			}
-			if p.Speed != "" && p.Speed != "fast" {
+			if p.Speed != "" {
 				name := strings.TrimSpace(p.Name)
 				if name == "" {
 					name = fmt.Sprintf("#%d", i)
 				}
-				return fmt.Errorf("provider %q speed must be fast when set, got %q", name, p.Speed)
+				return fmt.Errorf("provider %q speed is no longer supported; move it under models[].speed", name)
+			}
+			for _, m := range p.Models {
+				name := strings.TrimSpace(p.Name)
+				if name == "" {
+					name = fmt.Sprintf("#%d", i)
+				}
+				if m.Speed != "" && NormalizeSpeed(m.Speed) == "" {
+					return fmt.Errorf("provider %q model %q speed must be fast when set, got %q", name, m.Name, m.Speed)
+				}
+				if m.Verbosity != "" && NormalizeVerbosity(m.Verbosity) == "" {
+					return fmt.Errorf("provider %q model %q verbosity must be low, medium or high when set, got %q", name, m.Name, m.Verbosity)
+				}
 			}
 		}
 	}
@@ -450,9 +470,23 @@ func normalizeProviderFailovers(ps []Provider) {
 	}
 }
 
-func normalizeProviderSpeeds(ps []Provider) {
+// NormalizeSpeed normalizes a configured fast-tier hint. Only "fast" is accepted.
+func NormalizeSpeed(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "fast" {
+		return "fast"
+	}
+	return ""
+}
+
+// ResolvedSpeed returns the normalized fast-tier hint ("" when unset/invalid).
+func (m ModelAlias) ResolvedSpeed() string { return NormalizeSpeed(m.Speed) }
+
+func normalizeModelSpeeds(ps []Provider) {
 	for i := range ps {
-		ps[i].Speed = strings.ToLower(strings.TrimSpace(ps[i].Speed))
+		for j := range ps[i].Models {
+			ps[i].Models[j].Speed = NormalizeSpeed(ps[i].Models[j].Speed)
+		}
 	}
 }
 
@@ -484,3 +518,17 @@ func (m ModelAlias) ResolvedAlias() string {
 	}
 	return strings.TrimSpace(m.Name)
 }
+
+// NormalizeVerbosity normalizes a configured verbosity hint. Only low|medium|high
+// (GPT-5 series) are accepted; empty or invalid values return "".
+func NormalizeVerbosity(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	switch v {
+	case "low", "medium", "high":
+		return v
+	}
+	return ""
+}
+
+// ResolvedVerbosity returns the normalized verbosity hint ("" when unset/invalid).
+func (m ModelAlias) ResolvedVerbosity() string { return NormalizeVerbosity(m.Verbosity) }
