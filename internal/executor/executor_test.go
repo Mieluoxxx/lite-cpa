@@ -44,18 +44,39 @@ func TestApplySpeed(t *testing.T) {
 			wantValue: "",
 		},
 		{
-			name:      "OpenAI completions provider forces priority",
+			name:      "OpenAI completions provider removes priority",
 			key:       registry.UpstreamKey{Provider: "openai", Speed: "fast"},
-			body:      `{"service_tier":"flex"}`,
+			body:      `{"model":"gpt-5","service_tier":"flex"}`,
+			wantPath:  "service_tier",
+			wantValue: "",
+		},
+		{
+			name:      "OpenAI responses GPT provider forces priority",
+			key:       registry.UpstreamKey{Provider: "openai-response", Speed: "fast"},
+			body:      `{"model":"gpt-5","service_tier":"auto"}`,
 			wantPath:  "service_tier",
 			wantValue: "priority",
 		},
 		{
-			name:      "OpenAI responses provider forces priority",
+			name:      "OpenAI responses non-GPT provider removes priority",
 			key:       registry.UpstreamKey{Provider: "openai-response", Speed: "fast"},
-			body:      `{"service_tier":"auto"}`,
+			body:      `{"model":"claude-sonnet-5","service_tier":"auto"}`,
+			wantPath:  "service_tier",
+			wantValue: "",
+		},
+		{
+			name:      "OpenAI responses GPT uppercase forces priority",
+			key:       registry.UpstreamKey{Provider: "openai-response", Speed: "fast"},
+			body:      `{"model":"GPT-5","service_tier":"auto"}`,
 			wantPath:  "service_tier",
 			wantValue: "priority",
+		},
+		{
+			name:      "OpenAI responses GPT without fast removes client tier",
+			key:       registry.UpstreamKey{Provider: "openai-response"},
+			body:      `{"model":"gpt-5","service_tier":"priority"}`,
+			wantPath:  "service_tier",
+			wantValue: "",
 		},
 		{
 			name:      "OpenAI provider without fast removes client tier",
@@ -68,7 +89,7 @@ func TestApplySpeed(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotKey, gotBody := applySpeed(tt.key, []byte(tt.body))
+			gotKey, gotBody := applySpeed(tt.key, gjson.Get(tt.body, "model").String(), []byte(tt.body))
 			value := gjson.GetBytes(gotBody, tt.wantPath)
 			if tt.wantValue == "" {
 				if value.Exists() {
@@ -135,6 +156,7 @@ func TestApplyModelVerbosity(t *testing.T) {
 	tests := []struct {
 		name      string
 		to        translator.Format
+		model     string // upstream model passed by Execute; empty = derive from body.model
 		verbosity string
 		body      string
 		want      string // "" = absent
@@ -175,6 +197,42 @@ func TestApplyModelVerbosity(t *testing.T) {
 			want:      "",
 		},
 		{
+			name:      "responses non-GPT ignores verbosity",
+			to:        translator.FormatOpenAIResponse,
+			verbosity: "low",
+			body:      `{"model":"claude-sonnet-5","input":"hi"}`,
+			want:      "",
+		},
+		{
+			name:      "responses non-GPT strips client verbosity",
+			to:        translator.FormatOpenAIResponse,
+			verbosity: "low",
+			body:      `{"model":"claude-sonnet-5","text":{"verbosity":"high"},"input":"hi"}`,
+			want:      "",
+		},
+		{
+			name:      "responses GPT uppercase model injects",
+			to:        translator.FormatOpenAIResponse,
+			verbosity: "low",
+			body:      `{"model":"GPT-5","input":"hi"}`,
+			want:      "low",
+		},
+		{
+			name:      "responses uses passed upstream model not body.model",
+			to:        translator.FormatOpenAIResponse,
+			model:     "gpt-5",
+			verbosity: "low",
+			body:      `{"model":"my-alias","input":"hi"}`,
+			want:      "low",
+		},
+		{
+			name:      "responses GPT unconfigured keeps client verbosity",
+			to:        translator.FormatOpenAIResponse,
+			verbosity: "",
+			body:      `{"model":"gpt-5","text":{"verbosity":"medium"},"input":"hi"}`,
+			want:      "medium",
+		},
+		{
 			name:      "claude upstream ignores verbosity",
 			to:        translator.FormatClaude,
 			verbosity: "low",
@@ -184,7 +242,11 @@ func TestApplyModelVerbosity(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := applyModelVerbosity(tt.to, tt.verbosity, []byte(tt.body))
+			model := tt.model
+			if model == "" {
+				model = gjson.Get(tt.body, "model").String()
+			}
+			got := applyModelVerbosity(tt.to, model, tt.verbosity, []byte(tt.body))
 			value := gjson.GetBytes(got, "text.verbosity")
 			if tt.want == "" {
 				if value.Exists() {

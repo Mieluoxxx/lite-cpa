@@ -76,8 +76,8 @@ func Execute(ctx context.Context, key registry.UpstreamKey, upstreamModel string
 	if err != nil {
 		return nil, err
 	}
-	key, translated = applySpeed(key, translated)
-	translated = applyModelVerbosity(to, key.Verbosity, translated)
+	key, translated = applySpeed(key, baseModel, translated)
+	translated = applyModelVerbosity(to, baseModel, key.Verbosity, translated)
 
 	switch key.Provider {
 	case "openai":
@@ -101,10 +101,10 @@ func Execute(ctx context.Context, key registry.UpstreamKey, upstreamModel string
 }
 
 // applySpeed enforces the model-level fast tier. Configured "fast" injects the
-// native tier (Anthropic speed + fast-mode beta, OpenAI service_tier priority);
+// native tier (Anthropic speed + fast-mode beta, OpenAI Responses service_tier priority);
 // without it, client-selected fast-tier fields are removed so clients cannot
 // change speed or billing.
-func applySpeed(key registry.UpstreamKey, body []byte) (registry.UpstreamKey, []byte) {
+func applySpeed(key registry.UpstreamKey, model string, body []byte) (registry.UpstreamKey, []byte) {
 	switch key.Provider {
 	case "claude":
 		body, _ = sjson.DeleteBytes(body, "speed")
@@ -114,18 +114,31 @@ func applySpeed(key registry.UpstreamKey, body []byte) (registry.UpstreamKey, []
 		}
 	case "openai", "openai-response":
 		body, _ = sjson.DeleteBytes(body, "service_tier")
-		if key.Speed == "fast" {
+		if key.Provider == "openai-response" && key.Speed == "fast" && isGPTModel(model) {
 			body, _ = sjson.SetBytes(body, "service_tier", "priority")
 		}
 	}
 	return key, body
 }
 
+func isGPTModel(model string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "gpt-")
+}
+
 // applyModelVerbosity injects a configured model-level verbosity hint (low|medium|high)
-// as text.verbosity in Responses requests. Only openai-response upstreams accept it;
-// a client-set text.verbosity always wins (no overwrite).
-func applyModelVerbosity(to translator.Format, verbosity string, body []byte) []byte {
-	if to != translator.FormatOpenAIResponse || verbosity == "" {
+// as text.verbosity in Responses requests. Verbosity is honored only for Responses
+// requests on GPT models: a client-set text.verbosity wins over the configured hint,
+// and a non-GPT model has any client text.verbosity stripped. Ignored for non-Responses
+// upstreams.
+func applyModelVerbosity(to translator.Format, model, verbosity string, body []byte) []byte {
+	if to != translator.FormatOpenAIResponse {
+		return body
+	}
+	if !isGPTModel(model) {
+		body, _ = sjson.DeleteBytes(body, "text.verbosity")
+		return body
+	}
+	if verbosity == "" {
 		return body
 	}
 	if gjson.GetBytes(body, "text.verbosity").Exists() {

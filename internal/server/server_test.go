@@ -82,8 +82,99 @@ func TestChatCompletionsToOpenAIUpstream(t *testing.T) {
 	if gjson.Get(gotBody, "model").String() != "mock-model" {
 		t.Fatalf("upstream body %s", gotBody)
 	}
-	if gjson.Get(gotBody, "service_tier").String() != "priority" {
-		t.Fatalf("service_tier %q, want priority; body=%s", gjson.Get(gotBody, "service_tier").String(), gotBody)
+	if got := gjson.Get(gotBody, "service_tier"); got.Exists() {
+		t.Fatalf("service_tier should be absent for Chat Completions; got %q; body=%s", got.String(), gotBody)
+	}
+}
+
+func TestResponsesGPTInjectsServiceTierAndVerbosity(t *testing.T) {
+	translator.RegisterBuiltin()
+
+	var gotBody []byte
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","model":"gpt-5","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"pong"}]}]}`))
+	}))
+	t.Cleanup(up.Close)
+
+	port := freePort(t)
+	cfg := &config.Config{
+		Host: "127.0.0.1", Port: port, APIKeys: []string{"sk-test"}, MaxBodyBytes: 1 << 20,
+		OpenAIResponses: []config.Provider{{
+			BaseURL: up.URL + "/v1",
+			APIKey:  "sk-up",
+			Models:  []config.ModelAlias{{Name: "gpt-5", Alias: "gpt-5", Speed: "fast", Verbosity: "low"}},
+		}},
+	}
+	srv := server.New(cfg, nil)
+	go func() { _ = srv.ListenAndServe() }()
+	t.Cleanup(func() { _ = srv.Shutdown(t.Context()) })
+	waitHTTP(t, "http://127.0.0.1:"+strconv.Itoa(port)+"/healthz")
+
+	req, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+strconv.Itoa(port)+"/v1/responses",
+		strings.NewReader(`{"model":"gpt-5","input":"hi","stream":false}`))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d body %s", resp.StatusCode, raw)
+	}
+
+	if got := gjson.GetBytes(gotBody, "service_tier").String(); got != "priority" {
+		t.Fatalf("service_tier = %q, want priority; body=%s", got, gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "text.verbosity").String(); got != "low" {
+		t.Fatalf("text.verbosity = %q, want low; body=%s", got, gotBody)
+	}
+}
+
+func TestResponsesNonGPTStripsClientVerbosity(t *testing.T) {
+	translator.RegisterBuiltin()
+
+	var gotBody []byte
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","model":"grok-4.5","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"pong"}]}]}`))
+	}))
+	t.Cleanup(up.Close)
+
+	port := freePort(t)
+	cfg := &config.Config{
+		Host: "127.0.0.1", Port: port, APIKeys: []string{"sk-test"}, MaxBodyBytes: 1 << 20,
+		OpenAIResponses: []config.Provider{{
+			BaseURL: up.URL + "/v1",
+			APIKey:  "sk-up",
+			Models:  []config.ModelAlias{{Name: "grok-4.5", Alias: "grok-4.5", Verbosity: "low"}},
+		}},
+	}
+	srv := server.New(cfg, nil)
+	go func() { _ = srv.ListenAndServe() }()
+	t.Cleanup(func() { _ = srv.Shutdown(t.Context()) })
+	waitHTTP(t, "http://127.0.0.1:"+strconv.Itoa(port)+"/healthz")
+
+	req, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+strconv.Itoa(port)+"/v1/responses",
+		strings.NewReader(`{"model":"grok-4.5","text":{"verbosity":"high"},"input":"hi","stream":false}`))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d body %s", resp.StatusCode, raw)
+	}
+
+	if got := gjson.GetBytes(gotBody, "text.verbosity"); got.Exists() {
+		t.Fatalf("text.verbosity should be stripped for non-GPT Responses; got %q; body=%s", got.String(), gotBody)
 	}
 }
 
