@@ -101,9 +101,15 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 // Reload applies a newly loaded config in place.
-// host/port and request-log backend settings are immutable at runtime;
-// changing them returns an error and leaves the previous config active.
-// Invalid configs should be rejected by config.Load before calling Reload.
+//
+// Hot-reloadable fields (api-keys, providers/models/keys, request-retry,
+// channel-affinity, max-body-bytes, request-log.store-body) are always applied,
+// even when the same save also touched immutable fields.
+//
+// host/port and request-log backend identity (enabled/backend/path/dsn/
+// retention) are immutable at runtime: changes there are logged as a warning
+// and the previous values stay active, but every reloadable field in the same
+// save still takes effect. Invalid configs are rejected by config.Load first.
 func (s *Server) Reload(cfg *config.Config) error {
 	if cfg == nil {
 		return fmt.Errorf("reload: nil config")
@@ -118,27 +124,42 @@ func (s *Server) Reload(cfg *config.Config) error {
 		return fmt.Errorf("reload: server has no active config")
 	}
 
+	// Collect immutable-field drift; pin the old values into the stored config
+	// so s.cfg keeps reflecting what is actually live, and the warning re-fires
+	// on every subsequent reload instead of going silent after the first one.
+	var deferred []string
+	merged := *cfg
 	if old.Host != cfg.Host || old.Port != cfg.Port {
-		return fmt.Errorf("reload: host/port changes require process restart (was %s:%d, now %s:%d)",
-			old.Host, old.Port, cfg.Host, cfg.Port)
+		deferred = append(deferred, fmt.Sprintf("host/port (%s:%d -> %s:%d)",
+			old.Host, old.Port, cfg.Host, cfg.Port))
+		merged.Host = old.Host
+		merged.Port = old.Port
 	}
 	if requestLogIdentity(old.RequestLog) != requestLogIdentity(cfg.RequestLog) {
-		return fmt.Errorf("reload: request-log enable/backend/path/dsn changes require process restart")
+		deferred = append(deferred, "request-log enabled/backend/path/dsn/retention")
+		storeBody := merged.RequestLog.StoreBody // store-body stays hot-reloadable
+		merged.RequestLog = old.RequestLog
+		merged.RequestLog.StoreBody = storeBody
 	}
 
-	nextReg := pool.BuildRegistry(cfg)
+	nextReg := pool.BuildRegistry(&merged)
 	s.reg.ReplaceFrom(nextReg)
-	s.selector.SetRetry(cfg.RequestRetry)
-	s.auth.Replace(cfg.APIKeys)
-	s.affinity.Reconfigure(cfg.ChannelAffinity)
-	s.maxBody.Store(cfg.MaxBodyBytes)
+	s.selector.SetRetry(merged.RequestRetry)
+	s.selector.ResetRoundRobin() // start fresh against rebuilt key pools
+	s.auth.Replace(merged.APIKeys)
+	s.affinity.Reconfigure(merged.ChannelAffinity)
+	s.maxBody.Store(merged.MaxBodyBytes)
 
 	s.cfgMu.Lock()
-	s.cfg = cfg
+	s.cfg = &merged
 	s.cfgMu.Unlock()
 
 	log.Printf("config reloaded: models=%d retry=%d api-keys=%d",
-		len(s.reg.List()), cfg.RequestRetry, len(cfg.APIKeys))
+		len(s.reg.List()), merged.RequestRetry, len(merged.APIKeys))
+	if len(deferred) > 0 {
+		log.Printf("config reload: %s require process restart; previous values kept",
+			strings.Join(deferred, ", "))
+	}
 	return nil
 }
 

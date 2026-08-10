@@ -288,11 +288,11 @@ Runtime reloads the YAML without dropping the listen socket:
 - **File mtime poll** every ~1s (debounced 300ms) — works with Docker bind mounts and editor temp+rename saves
 - **`SIGHUP`** — `kill -HUP $(pidof lite-cpa)`
 
-**Hot-swapped:** `api-keys`, providers/models/keys/priority/failover, `request-retry`, `channel-affinity`, `debug`, `max-body-bytes`, global `proxy-url` (via rebuilt keys).
+**Hot-swapped:** `api-keys`, providers/models/keys/priority/failover, `request-retry`, `channel-affinity`, `debug`, `max-body-bytes`, `request-log.store-body`, global `proxy-url` (via rebuilt keys). These are applied even when the same save also touched an immutable field below.
 
-**Requires restart:** `host`, `port`, and request-log `enabled` / `backend` / sqlite path / postgres DSN / retention (logger is opened once at boot).
+**Require restart (ignored until restart, logged as a warning):** `host`, `port`, and request-log `enabled` / `backend` / sqlite path / postgres DSN / `retention` (logger is opened once at boot). Drift here does **not** abort the reload — the previous values stay active and every reloadable field in the same save still takes effect; the warning re-fires on each reload until the process is restarted.
 
-Invalid YAML or validation errors keep the previous config and log `config reload: ... (keeping previous config)`.
+Invalid YAML or validation errors keep the previous config entirely and log `config reload: ... (keeping previous config)`.
 
 
 ### Docker Compose (recommended)
@@ -313,8 +313,7 @@ docker compose down
 
 - Image: multi-stage `golang:1.26-alpine` → `alpine:3.23`, non-root user `lite` (uid 10001).
 - Env: `TZ=Asia/Shanghai` (override as needed).
-- Config hot-reload: edit `config.yaml` in place (or `kill -HUP <pid>`). Providers / keys / models / affinity / `api-keys` / `request-retry` / `debug` / `max-body-bytes` apply without restart. `host`/`port` and request-log enable/backend/path/dsn still need process restart.
-
+- Config hot-reload: edit `config.yaml` in place (or `kill -HUP <pid>`). Providers / keys / models / affinity / `api-keys` / `request-retry` / `debug` / `max-body-bytes` apply without restart. `host`/`port` and request-log enable/backend/path/dsn/retention are ignored until restart (logged as a warning; the rest of that save still applies).
 #### Optional Postgres for request-log
 
 1. Uncomment the `postgres` service in `docker-compose.yml`.

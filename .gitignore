@@ -47,6 +47,7 @@ Desktop.ini
 # Local tooling / caches
 .codegraph/
 .omp/
+.pi-subagents/
 tmp/
 temp/
 *.log

@@ -92,27 +92,49 @@ func TestReloadSwapsAPIKeysAndModels(t *testing.T) {
 	}
 }
 
-func TestReloadRejectsHostPortChange(t *testing.T) {
+// TestReloadPinsHostPortAndAppliesRest verifies that a host/port change in the
+// same save as a reloadable change does not abort the whole reload: the old
+// host/port stays active (logged as a warning) and the reloadable field still
+// takes effect.
+func TestReloadPinsHostPortAndAppliesRest(t *testing.T) {
 	port := freePort(t)
 	cfg := &config.Config{
-		Host: "127.0.0.1", Port: port, APIKeys: []string{"sk-test"}, MaxBodyBytes: 1 << 20,
+		Host: "127.0.0.1", Port: port, APIKeys: []string{"sk-old"}, MaxBodyBytes: 1 << 20,
 		OpenAICompletions: []config.Provider{{
 			Name: "x", BaseURL: "http://127.0.0.1:9", APIKey: "k",
 			Models: []config.ModelAlias{{Name: "a", Alias: "a"}},
 		}},
 	}
 	srv := server.New(cfg, nil)
+	go func() { _ = srv.ListenAndServe() }()
+	t.Cleanup(func() { _ = srv.Shutdown(t.Context()) })
+	waitHTTP(t, "http://127.0.0.1:"+strconv.Itoa(port)+"/healthz")
+
 	next := *cfg
-	next.Port = port + 1
-	if err := srv.Reload(&next); err == nil || !strings.Contains(err.Error(), "host/port") {
-		t.Fatalf("want host/port error, got %v", err)
+	next.Port = port + 1              // immutable: pinned to old
+	next.APIKeys = []string{"sk-new"} // hot: must take effect
+	if err := srv.Reload(&next); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	// New gateway key passes auth (not 401) despite the port drift — the upstream
+	// is unreachable so the call fails downstream, but auth was reloaded.
+	if code := postChatReload(t, port, "sk-new", "a"); code == 401 {
+		t.Fatalf("new key after reload rejected as 401; auth was not applied")
+	}
+	// Old gateway key is now rejected by the reloaded auth.
+	if code := postChatReload(t, port, "sk-old", "a"); code != 401 {
+		t.Fatalf("old key after reload status=%d want 401", code)
 	}
 }
 
-func TestReloadRejectsRequestLogIdentityChange(t *testing.T) {
+// TestReloadPinsRequestLogAndAppliesRest verifies that touching request-log
+// backend identity does not abort the reload: the old request-log stays active
+// (logged as a warning) while the reloadable field still takes effect.
+func TestReloadPinsRequestLogAndAppliesRest(t *testing.T) {
 	port := freePort(t)
 	cfg := &config.Config{
-		Host: "127.0.0.1", Port: port, APIKeys: []string{"sk-test"}, MaxBodyBytes: 1 << 20,
+		Host: "127.0.0.1", Port: port, APIKeys: []string{"sk-old"}, MaxBodyBytes: 1 << 20,
 		OpenAICompletions: []config.Provider{{
 			Name: "x", BaseURL: "http://127.0.0.1:9", APIKey: "k",
 			Models: []config.ModelAlias{{Name: "a", Alias: "a"}},
@@ -120,11 +142,25 @@ func TestReloadRejectsRequestLogIdentityChange(t *testing.T) {
 		RequestLog: config.RequestLogConfig{Enabled: false, Backend: "sqlite", Retention: "168h"},
 	}
 	srv := server.New(cfg, nil)
+	go func() { _ = srv.ListenAndServe() }()
+	t.Cleanup(func() { _ = srv.Shutdown(t.Context()) })
+	waitHTTP(t, "http://127.0.0.1:"+strconv.Itoa(port)+"/healthz")
+
 	next := *cfg
-	next.RequestLog.Enabled = true
-	next.RequestLog.SQLite.Path = "logs/other.db"
-	if err := srv.Reload(&next); err == nil || !strings.Contains(err.Error(), "request-log") {
-		t.Fatalf("want request-log error, got %v", err)
+	next.RequestLog.Enabled = true                // immutable identity: pinned
+	next.RequestLog.SQLite.Path = "logs/other.db" // immutable identity: pinned
+	next.APIKeys = []string{"sk-new"}             // hot: must take effect
+	if err := srv.Reload(&next); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	// New gateway key passes auth (not 401) despite the request-log drift.
+	if code := postChatReload(t, port, "sk-new", "a"); code == 401 {
+		t.Fatalf("new key after reload rejected as 401; auth was not applied")
+	}
+	// Old gateway key is now rejected by the reloaded auth.
+	if code := postChatReload(t, port, "sk-old", "a"); code != 401 {
+		t.Fatalf("old key after reload status=%d want 401", code)
 	}
 }
 

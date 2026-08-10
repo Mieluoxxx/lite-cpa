@@ -205,3 +205,38 @@ func TestModelSpeedVerbosityPropagateToKeys(t *testing.T) {
 		}
 	}
 }
+
+// TestResetRoundRobin verifies the counter map is cleared: after picks
+// advance the counter, ResetRoundRobin makes the next pick land on index 0.
+func TestResetRoundRobin(t *testing.T) {
+	cfg := &config.Config{
+		OpenAIResponses: []config.Provider{{
+			Name:     "hub",
+			Priority: 0,
+			BaseURL:  "https://hub.example",
+			APIKeyEntries: []config.APIKeyEntry{
+				{APIKey: "sk-0"},
+				{APIKey: "sk-1"},
+				{APIKey: "sk-2"},
+			},
+			Models: []config.ModelAlias{{Name: "m"}},
+		}},
+	}
+	sel := pool.NewSelector(pool.BuildRegistry(cfg), 0)
+
+	// Advance the round-robin counter a couple of times.
+	for i := 0; i < 3; i++ {
+		if _, _, err := sel.Pick("m", nil, "", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Reset: the very next pick should be back at index 0 (sk-0).
+	sel.ResetRoundRobin()
+	k, _, err := sel.Pick("m", nil, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k.APIKey != "sk-0" {
+		t.Fatalf("after reset first pick = %s, want sk-0", k.APIKey)
+	}
+}

@@ -165,6 +165,19 @@ func (s *Selector) SetRetry(retry int) {
 	s.mu.Unlock()
 }
 
+// ResetRoundRobin clears per-model round-robin counters. Called on reload so
+// selection starts fresh against the rebuilt key pools; without this, a model
+// whose key set shrank/expanded/reordered would carry a stale counter and the
+// first picks after reload could land on an arbitrary offset. Resetting makes
+// post-reload selection deterministic and drops counters for models that no
+// longer exist.
+func (s *Selector) ResetRoundRobin() {
+	s.rr.Range(func(key, _ any) bool {
+		s.rr.Delete(key)
+		return true
+	})
+}
+
 // Pick chooses the next unused key for model.
 // preferSupplier (if non-empty) prefers remaining keys from that provider Name first.
 // skipSuppliers excludes all keys under those provider Names (dead relay).
