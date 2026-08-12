@@ -119,7 +119,9 @@ function appendLogFilters(query: URLSearchParams, filters: Filters): void {
 
 function compact(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return '0'
-  return new Intl.NumberFormat(undefined, {
+  // Force English locale so token counts always render as K/M/B,
+  // regardless of the browser language (zh would show 万/亿 otherwise).
+  return new Intl.NumberFormat('en', {
     notation: 'compact',
     maximumFractionDigits: 1,
   }).format(value)
