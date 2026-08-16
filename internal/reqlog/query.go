@@ -12,25 +12,29 @@ type ListFilter struct {
 	Upstream   string
 	Protocol   string
 	Status     string // "2xx", "4xx", "5xx", etc.
+	Outcome    string
 	ErrorsOnly bool
 }
 
 // Stats is aggregate request-log metrics for the monitor dashboard.
 type Stats struct {
-	Enabled       bool        `json:"enabled"`
-	Total         int64       `json:"total"`
-	Errors        int64       `json:"errors"`
-	Success       int64       `json:"success"`
-	AvgDurationMS float64     `json:"avg_duration_ms"`
-	InputTokens   int64       `json:"input_tokens"`
-	OutputTokens  int64       `json:"output_tokens"`
-	CachedTokens  int64       `json:"cached_tokens"`
-	CacheHitRate  float64     `json:"cache_hit_rate"`
-	OutputTPS     float64     `json:"output_tps"`
-	ByStatus      []NameCount `json:"by_status"`
-	ByModel       []NameCount `json:"by_model"`
-	ByUpstream    []NameCount `json:"by_upstream"`
-	ByProtocol    []NameCount `json:"by_protocol"`
+	Enabled         bool        `json:"enabled"`
+	Total           int64       `json:"total"`
+	Errors          int64       `json:"errors"`
+	Success         int64       `json:"success"`
+	Canceled        int64       `json:"canceled"`
+	Unknown         int64       `json:"unknown"`
+	UsageIncomplete int64       `json:"usage_incomplete"`
+	AvgDurationMS   float64     `json:"avg_duration_ms"`
+	InputTokens     int64       `json:"input_tokens"`
+	OutputTokens    int64       `json:"output_tokens"`
+	CachedTokens    int64       `json:"cached_tokens"`
+	CacheHitRate    float64     `json:"cache_hit_rate"`
+	OutputTPS       float64     `json:"output_tps"`
+	ByStatus        []NameCount `json:"by_status"`
+	ByModel         []NameCount `json:"by_model"`
+	ByUpstream      []NameCount `json:"by_upstream"`
+	ByProtocol      []NameCount `json:"by_protocol"`
 }
 
 // NameCount is a named bucket used by Stats.
@@ -125,9 +129,9 @@ func finalizeStats(st *Stats) {
 	if st.ByProtocol == nil {
 		st.ByProtocol = []NameCount{}
 	}
-	st.Success = st.Total - st.Errors
-	if st.Success < 0 {
-		st.Success = 0
+	st.Unknown = st.Total - st.Success - st.Errors - st.Canceled
+	if st.Unknown < 0 {
+		st.Unknown = 0
 	}
 	if st.InputTokens > 0 {
 		st.CacheHitRate = float64(st.CachedTokens) / float64(st.InputTokens)

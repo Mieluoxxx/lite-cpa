@@ -157,9 +157,10 @@ func TestSQLiteListAndStats(t *testing.T) {
 
 	now := time.Now().UTC()
 	rows := []Record{
-		{RequestID: "a", Timestamp: now.Add(-2 * time.Second), Method: "POST", Path: "/v1/messages", StatusCode: 200, Model: "claude-x", Protocol: "claude", Upstream: "anth", DurationMS: 10, InputTokens: 100, OutputTokens: 10, CachedTokens: 40},
-		{RequestID: "b", Timestamp: now.Add(-1 * time.Second), Method: "POST", Path: "/v1/responses", StatusCode: 429, Model: "gpt-x", Protocol: "responses", Upstream: "laysath", DurationMS: 20, InputTokens: 200, OutputTokens: 20, CachedTokens: 50, Error: "rate"},
+		{RequestID: "a", Timestamp: now.Add(-2 * time.Second), Method: "POST", Path: "/v1/messages", StatusCode: 200, Model: "claude-x", Protocol: "claude", Upstream: "anth", DurationMS: 10, InputTokens: 100, OutputTokens: 10, CachedTokens: 40, UsageComplete: true},
+		{RequestID: "b", Timestamp: now.Add(-1 * time.Second), Method: "POST", Path: "/v1/responses", StatusCode: 429, Model: "gpt-x", Protocol: "responses", Upstream: "laysath", DurationMS: 20, InputTokens: 200, OutputTokens: 20, CachedTokens: 50, UsageComplete: true, Error: "rate"},
 		{RequestID: "c", Timestamp: now, Method: "POST", Path: "/v1/chat/completions", StatusCode: 500, Model: "gpt-x", Protocol: "chat", Upstream: "laysath", DurationMS: 30, Error: "boom"},
+		{RequestID: "d", Timestamp: now.Add(-3 * time.Second), Method: "POST", Path: "/v1/responses", StatusCode: 200, Outcome: OutcomeClientCanceled, Model: "gpt-canceled", Protocol: "responses", Upstream: "openai", DurationMS: 40, Error: "context canceled"},
 	}
 	for _, r := range rows {
 		if err := store.Insert(context.Background(), r); err != nil {
@@ -171,8 +172,8 @@ func TestSQLiteListAndStats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if total != 3 {
-		t.Fatalf("total %d want 3", total)
+	if total != 4 {
+		t.Fatalf("total %d want 4", total)
 	}
 	if len(items) != 2 {
 		t.Fatalf("page len %d want 2", len(items))
@@ -180,7 +181,7 @@ func TestSQLiteListAndStats(t *testing.T) {
 	if items[0].RequestID != "c" || items[1].RequestID != "b" {
 		t.Fatalf("order got %q %q", items[0].RequestID, items[1].RequestID)
 	}
-	if items[1].InputTokens != 200 || items[1].OutputTokens != 20 || items[1].CachedTokens != 50 {
+	if items[1].InputTokens != 200 || items[1].OutputTokens != 20 || items[1].CachedTokens != 50 || !items[1].UsageComplete || items[1].Outcome != OutcomeError {
 		t.Fatalf("listed tokens = (%d, %d, %d), want (200, 20, 50)", items[1].InputTokens, items[1].OutputTokens, items[1].CachedTokens)
 	}
 
@@ -190,6 +191,13 @@ func TestSQLiteListAndStats(t *testing.T) {
 	}
 	if errTotal != 2 || len(errItems) != 2 {
 		t.Fatalf("errors total=%d len=%d", errTotal, len(errItems))
+	}
+	canceledItems, canceledTotal, err := store.List(context.Background(), ListFilter{Outcome: OutcomeClientCanceled, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canceledTotal != 1 || len(canceledItems) != 1 || canceledItems[0].RequestID != "d" {
+		t.Fatalf("canceled total=%d items=%#v", canceledTotal, canceledItems)
 	}
 
 	modelItems, modelTotal, err := store.List(context.Background(), ListFilter{Model: "gpt-x", Limit: 10})
@@ -204,13 +212,16 @@ func TestSQLiteListAndStats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Total != 3 || st.Errors != 2 || st.Success != 1 {
-		t.Fatalf("stats total=%d errors=%d success=%d", st.Total, st.Errors, st.Success)
+	if st.Total != 4 || st.Errors != 2 || st.Success != 1 || st.Canceled != 1 || st.Unknown != 0 {
+		t.Fatalf("stats total=%d errors=%d success=%d canceled=%d unknown=%d", st.Total, st.Errors, st.Success, st.Canceled, st.Unknown)
 	}
-	if st.AvgDurationMS < 19 || st.AvgDurationMS > 21 {
+	if st.UsageIncomplete != 2 {
+		t.Fatalf("usage incomplete=%d want 2", st.UsageIncomplete)
+	}
+	if st.AvgDurationMS < 24 || st.AvgDurationMS > 26 {
 		t.Fatalf("avg duration %v", st.AvgDurationMS)
 	}
-	if st.InputTokens != 300 || st.OutputTokens != 30 || st.CachedTokens != 90 || st.OutputTPS != 500 {
+	if st.InputTokens != 300 || st.OutputTokens != 30 || st.CachedTokens != 90 || st.OutputTPS != 1000 {
 		t.Fatalf("token stats input=%d output=%d cached=%d tps=%v", st.InputTokens, st.OutputTokens, st.CachedTokens, st.OutputTPS)
 	}
 	if st.CacheHitRate != 0.3 {
@@ -241,8 +252,8 @@ func TestSQLiteListAndStats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if deleted != 3 {
-		t.Fatalf("cleared %d want 3", deleted)
+	if deleted != 4 {
+		t.Fatalf("cleared %d want 4", deleted)
 	}
 	clearedItems, clearedTotal, err := store.List(context.Background(), ListFilter{Limit: 10})
 	if err != nil {

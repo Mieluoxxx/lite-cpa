@@ -1,6 +1,8 @@
 package server_test
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"net"
@@ -813,12 +815,91 @@ func TestResponsesStreamUnexpectedEOFEmitsFailedAndLogsCause(t *testing.T) {
 			t.Fatal(listErr)
 		}
 		for _, record := range logs.Items {
-			if record.Upstream == "truncated" && record.StatusCode == http.StatusOK && strings.Contains(record.Error, "unexpected EOF") {
+			if record.Upstream == "truncated" && record.StatusCode == http.StatusOK && record.Outcome == reqlog.OutcomeError && !record.UsageComplete && strings.Contains(record.Error, "unexpected EOF") {
 				return
 			}
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("missing unexpected EOF request log: %#v", logs.Items)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestResponsesStreamClientCancelKeepsWireStatusAndOutcome(t *testing.T) {
+	translator.RegisterBuiltin()
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cancel\",\"status\":\"in_progress\"}}\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(up.Close)
+
+	logger, err := reqlog.Open(config.RequestLogConfig{
+		Enabled: true, Backend: "sqlite", Retention: "1h",
+		SQLite: config.SQLiteLogConfig{Path: filepath.Join(t.TempDir(), "requests.db")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = logger.Close() })
+
+	port := freePort(t)
+	srv := server.New(&config.Config{
+		Host: "127.0.0.1", Port: port, APIKeys: []string{"sk-test"}, MaxBodyBytes: 1 << 20,
+		OpenAIResponses: []config.Provider{{
+			Name: "cancel-upstream", BaseURL: up.URL + "/v1", APIKey: "sk-up",
+			Models: []config.ModelAlias{{Name: "gpt-5", Alias: "gpt-5"}},
+		}},
+	}, logger)
+	go func() { _ = srv.ListenAndServe() }()
+	t.Cleanup(func() { _ = srv.Shutdown(t.Context()) })
+	baseURL := "http://127.0.0.1:" + strconv.Itoa(port)
+	waitHTTP(t, baseURL+"/healthz")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/responses", strings.NewReader(`{"model":"gpt-5","input":"hi","stream":true}`))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("status=%d want 200", resp.StatusCode)
+	}
+	if _, err := bufio.NewReader(resp.Body).ReadString('\n'); err != nil {
+		resp.Body.Close()
+		t.Fatalf("read initial stream event: %v", err)
+	}
+	cancel()
+	_ = resp.Body.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		logs, listErr := logger.List(t.Context(), reqlog.ListFilter{Limit: 10})
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		if len(logs.Items) == 1 {
+			record := logs.Items[0]
+			if record.StatusCode != http.StatusOK || record.Outcome != reqlog.OutcomeClientCanceled || record.UsageComplete {
+				t.Fatalf("canceled record = %#v", record)
+			}
+			stats, statsErr := logger.Stats(t.Context(), reqlog.ListFilter{})
+			if statsErr != nil {
+				t.Fatal(statsErr)
+			}
+			if stats.Total != 1 || stats.Success != 0 || stats.Errors != 0 || stats.Canceled != 1 || stats.UsageIncomplete != 1 {
+				t.Fatalf("canceled stats = %#v", stats)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("missing canceled request log: %#v", logs.Items)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

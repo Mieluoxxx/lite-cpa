@@ -214,13 +214,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, source tran
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("read body: %v", err))
-		s.logReq(reqID, r, protocol, "", "", "", http.StatusBadRequest, start, err.Error(), body, nil)
+		s.logReq(reqID, r, protocol, "", "", "", http.StatusBadRequest, reqlog.OutcomeError, start, err.Error(), body, nil)
 		return
 	}
 	model := gjson.GetBytes(body, "model").String()
 	if model == "" {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "model is required")
-		s.logReq(reqID, r, protocol, "", "", "", http.StatusBadRequest, start, "model is required", body, nil)
+		s.logReq(reqID, r, protocol, "", "", "", http.StatusBadRequest, reqlog.OutcomeError, start, "model is required", body, nil)
 		return
 	}
 	baseModel := thinking.ParseSuffix(model).ModelName
@@ -237,7 +237,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, source tran
 		})
 }
 
-func (s *Server) logReq(id string, r *http.Request, protocol, model, provider, upstream string, status int, start time.Time, errMsg string, reqBody, respBody []byte, usage ...tokenUsage) {
+func (s *Server) logReq(id string, r *http.Request, protocol, model, provider, upstream string, status int, outcome string, start time.Time, errMsg string, reqBody, respBody []byte, usage ...tokenUsage) {
 	if s.logger == nil || !s.logger.Enabled() {
 		return
 	}
@@ -247,6 +247,7 @@ func (s *Server) logReq(id string, r *http.Request, protocol, model, provider, u
 		Method:     r.Method,
 		Path:       r.URL.Path,
 		StatusCode: status,
+		Outcome:    outcome,
 		Model:      model,
 		Protocol:   protocol,
 		Provider:   provider,
@@ -259,6 +260,9 @@ func (s *Server) logReq(id string, r *http.Request, protocol, model, provider, u
 		rec.InputTokens = usage[0].inputTokens
 		rec.OutputTokens = usage[0].outputTokens
 		rec.CachedTokens = usage[0].cachedTokens
+		rec.UsageComplete = outcome == reqlog.OutcomeCompleted && usage[0].complete()
+	} else if outcome == reqlog.OutcomeCompleted && protocol == "openai-image" {
+		rec.UsageComplete = true
 	}
 	if s.currentCfg().RequestLog.StoreBody {
 		// Cap stored bodies to keep memory/disk bounded.
@@ -403,6 +407,10 @@ func (s *Server) forward(
 		attemptStart := time.Now()
 		result, err := execute(r.Context(), key, upstreamModel)
 		if err != nil {
+			if ctxErr := r.Context().Err(); ctxErr != nil {
+				s.logReq(reqID, r, protocol, model, key.Provider, key.Name, 0, reqlog.OutcomeClientCanceled, attemptStart, ctxErr.Error(), body, nil)
+				return
+			}
 			lastErr = err
 			lastErrLogged = false
 			if aff.Matched && aff.CacheKey != "" && key.ID == aff.KeyID {
@@ -413,7 +421,7 @@ func (s *Server) forward(
 			}
 			if se, ok := err.(executor.StatusError); ok {
 				if se.Code == 401 || se.Code == 403 || se.Code == 429 || se.Code >= 500 {
-					s.logReq(reqID, r, protocol, model, key.Provider, key.Name, se.Code, attemptStart, se.Error(), body, nil)
+					s.logReq(reqID, r, protocol, model, key.Provider, key.Name, se.Code, reqlog.OutcomeError, attemptStart, se.Error(), body, nil)
 					lastErrLogged = true
 					if s.debugEnabled() {
 						log.Printf("upstream %s/%s failed status=%d, rotating (mode=%s)", key.Name, key.ID, se.Code, key.FailoverMode)
@@ -432,10 +440,10 @@ func (s *Server) forward(
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(se.Code)
 				_, _ = w.Write([]byte(se.Body))
-				s.logReq(reqID, r, protocol, model, key.Provider, key.Name, se.Code, start, se.Error(), body, []byte(se.Body))
+				s.logReq(reqID, r, protocol, model, key.Provider, key.Name, se.Code, reqlog.OutcomeError, start, se.Error(), body, []byte(se.Body))
 				return
 			}
-			s.logReq(reqID, r, protocol, model, key.Provider, key.Name, http.StatusBadGateway, attemptStart, err.Error(), body, nil)
+			s.logReq(reqID, r, protocol, model, key.Provider, key.Name, http.StatusBadGateway, reqlog.OutcomeError, attemptStart, err.Error(), body, nil)
 			lastErrLogged = true
 			if aff.Found && aff.SkipRetry && key.ID == aff.KeyID {
 				break
@@ -447,6 +455,10 @@ func (s *Server) forward(
 				}
 			}
 			continue
+		}
+		if ctxErr := r.Context().Err(); ctxErr != nil {
+			s.logReq(reqID, r, protocol, model, key.Provider, key.Name, 0, reqlog.OutcomeClientCanceled, attemptStart, ctxErr.Error(), body, nil)
+			return
 		}
 
 		if aff.Matched {
@@ -462,15 +474,24 @@ func (s *Server) forward(
 		case *executor.Result:
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(v.Body)
+			_, writeErr := w.Write(v.Body)
 			usage := usageFromResponse(v.Body)
-			s.logReq(reqID, r, protocol, model, key.Provider, key.Name, http.StatusOK, start, "", body, v.Body, usage)
+			outcome := reqlog.OutcomeCompleted
+			errMsg := ""
+			if writeErr != nil {
+				outcome = reqlog.OutcomeClientCanceled
+				errMsg = writeErr.Error()
+			} else if ctxErr := r.Context().Err(); ctxErr != nil {
+				outcome = reqlog.OutcomeClientCanceled
+				errMsg = ctxErr.Error()
+			}
+			s.logReq(reqID, r, protocol, model, key.Provider, key.Name, http.StatusOK, outcome, start, errMsg, body, v.Body, usage)
 			return
 		case *executor.StreamResult:
 			flusher, ok := w.(http.Flusher)
 			if !ok {
 				writeAPIError(w, http.StatusInternalServerError, "server_error", "streaming not supported")
-				s.logReq(reqID, r, protocol, model, key.Provider, key.Name, http.StatusInternalServerError, start, "streaming not supported", body, nil)
+				s.logReq(reqID, r, protocol, model, key.Provider, key.Name, http.StatusInternalServerError, reqlog.OutcomeError, start, "streaming not supported", body, nil)
 				return
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -479,6 +500,7 @@ func (s *Server) forward(
 			w.WriteHeader(http.StatusOK)
 			flusher.Flush()
 			var streamErr string
+			clientCanceled := false
 			var usage tokenUsage
 			for chunk := range v.Chunks {
 				if chunk.Err != nil {
@@ -497,11 +519,22 @@ func (s *Server) forward(
 				usage.mergePayload(chunk.Payload)
 				if _, err := w.Write(chunk.Payload); err != nil {
 					streamErr = err.Error()
+					clientCanceled = true
 					break
 				}
 				flusher.Flush()
 			}
-			s.logReq(reqID, r, protocol, model, key.Provider, key.Name, http.StatusOK, start, streamErr, body, nil, usage)
+			if ctxErr := r.Context().Err(); ctxErr != nil {
+				clientCanceled = true
+				streamErr = ctxErr.Error()
+			}
+			outcome := reqlog.OutcomeCompleted
+			if clientCanceled {
+				outcome = reqlog.OutcomeClientCanceled
+			} else if streamErr != "" {
+				outcome = reqlog.OutcomeError
+			}
+			s.logReq(reqID, r, protocol, model, key.Provider, key.Name, http.StatusOK, outcome, start, streamErr, body, nil, usage)
 			return
 		default:
 			lastErr = fmt.Errorf("unexpected executor result type %T", result)
@@ -515,7 +548,7 @@ func (s *Server) forward(
 			w.WriteHeader(se.Code)
 			_, _ = w.Write([]byte(se.Body))
 			if !lastErrLogged {
-				s.logReq(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, se.Code, start, se.Error(), body, []byte(se.Body))
+				s.logReq(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, se.Code, reqlog.OutcomeError, start, se.Error(), body, []byte(se.Body))
 			}
 			return
 		}
@@ -526,12 +559,12 @@ func (s *Server) forward(
 		}
 		writeAPIError(w, code, "server_error", msg)
 		if !lastErrLogged {
-			s.logReq(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, code, start, msg, body, nil)
+			s.logReq(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, code, reqlog.OutcomeError, start, msg, body, nil)
 		}
 		return
 	}
 	writeAPIError(w, http.StatusBadGateway, "server_error", "all upstream credentials failed")
-	s.logReq(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, http.StatusBadGateway, start, "all upstream credentials failed", body, nil)
+	s.logReq(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, http.StatusBadGateway, reqlog.OutcomeError, start, "all upstream credentials failed", body, nil)
 }
 
 // handleImages proxies OpenAI Images API requests (/v1/images/generations,
@@ -546,19 +579,19 @@ func (s *Server) handleImages(w http.ResponseWriter, r *http.Request, imageEndpo
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("read body: %v", err))
-		s.logReq(reqID, r, "openai-image", "", "", "", http.StatusBadRequest, start, err.Error(), body, nil)
+		s.logReq(reqID, r, "openai-image", "", "", "", http.StatusBadRequest, reqlog.OutcomeError, start, err.Error(), body, nil)
 		return
 	}
 
 	model, stream, err := extractImageMeta(body, r.Header.Get("Content-Type"))
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
-		s.logReq(reqID, r, "openai-image", "", "", "", http.StatusBadRequest, start, err.Error(), body, nil)
+		s.logReq(reqID, r, "openai-image", "", "", "", http.StatusBadRequest, reqlog.OutcomeError, start, err.Error(), body, nil)
 		return
 	}
 	if model == "" {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "model is required")
-		s.logReq(reqID, r, "openai-image", "", "", "", http.StatusBadRequest, start, "model is required", body, nil)
+		s.logReq(reqID, r, "openai-image", "", "", "", http.StatusBadRequest, reqlog.OutcomeError, start, "model is required", body, nil)
 		return
 	}
 

@@ -159,9 +159,9 @@ func TestFilteredLogStats(t *testing.T) {
 
 	now := time.Now().UTC()
 	for _, record := range []reqlog.Record{
-		{RequestID: "gpt-relay", Timestamp: now, Method: "POST", Path: "/v1/responses", StatusCode: http.StatusTooManyRequests, Model: "gpt-x", Upstream: "laysath", InputTokens: 200, OutputTokens: 20, CachedTokens: 50, Error: "rate limited"},
-		{RequestID: "gpt-official", Timestamp: now.Add(time.Second), Method: "POST", Path: "/v1/responses", StatusCode: http.StatusOK, Model: "gpt-x", Upstream: "openai", InputTokens: 300, OutputTokens: 30, CachedTokens: 10},
-		{RequestID: "claude-relay", Timestamp: now.Add(2 * time.Second), Method: "POST", Path: "/v1/messages", StatusCode: http.StatusOK, Model: "claude-x", Upstream: "laysath", InputTokens: 100, OutputTokens: 10, CachedTokens: 5},
+		{RequestID: "gpt-relay", Timestamp: now, Method: "POST", Path: "/v1/responses", StatusCode: http.StatusTooManyRequests, Model: "gpt-x", Upstream: "laysath", InputTokens: 200, OutputTokens: 20, CachedTokens: 50, UsageComplete: true, Error: "rate limited"},
+		{RequestID: "gpt-official", Timestamp: now.Add(time.Second), Method: "POST", Path: "/v1/responses", StatusCode: http.StatusOK, Model: "gpt-x", Upstream: "openai", InputTokens: 300, OutputTokens: 30, CachedTokens: 10, UsageComplete: true},
+		{RequestID: "claude-relay", Timestamp: now.Add(2 * time.Second), Method: "POST", Path: "/v1/messages", StatusCode: http.StatusOK, Model: "claude-x", Upstream: "laysath", InputTokens: 100, OutputTokens: 10, CachedTokens: 5, UsageComplete: true},
 	} {
 		logger.Record(record)
 	}

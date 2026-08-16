@@ -25,6 +25,9 @@ type Stats = {
   total: number
   errors: number
   success: number
+  canceled: number
+  unknown: number
+  usage_incomplete: number
   input_tokens: number
   output_tokens: number
   cached_tokens: number
@@ -44,6 +47,7 @@ type RequestLog = {
   method: string
   path: string
   status_code: number
+  outcome: string
   model: string
   protocol: string
   provider: string
@@ -53,6 +57,7 @@ type RequestLog = {
   input_tokens: number
   output_tokens: number
   cached_tokens: number
+  usage_complete: boolean
   error: string
   req_body?: string
   resp_body?: string
@@ -70,7 +75,7 @@ type Filters = {
   upstream: string
   protocol: string
   status: string
-  errorsOnly: boolean
+  outcome: string
 }
 
 const API_KEY_STORAGE = 'lite-cpa-api-key'
@@ -114,7 +119,7 @@ function appendLogFilters(query: URLSearchParams, filters: Filters): void {
   if (filters.upstream) query.set('upstream', filters.upstream)
   if (filters.protocol) query.set('protocol', filters.protocol)
   if (filters.status) query.set('status', filters.status)
-  if (filters.errorsOnly) query.set('errors', '1')
+  if (filters.outcome) query.set('outcome', filters.outcome)
 }
 
 function compact(value: number): string {
@@ -156,15 +161,36 @@ function formatDateTime(value: string): string {
 }
 
 function tokensPerSecond(record: RequestLog): string {
-  if (record.output_tokens <= 0 || record.duration_ms <= 0) return '—'
+  if (!record.usage_complete || record.output_tokens <= 0 || record.duration_ms <= 0) return '—'
   return ((record.output_tokens * 1000) / record.duration_ms).toFixed(1)
 }
 
-function statusTone(status: number): string {
-  if (status >= 500) return 'bg-red-500/12 text-red-700 dark:text-red-300'
-  if (status >= 400) return 'bg-amber-500/12 text-amber-700 dark:text-amber-300'
-  if (status >= 200 && status < 300) return 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300'
+function outcomeLabel(outcome: string): string {
+  if (outcome === 'completed') return '成功'
+  if (outcome === 'error') return '错误'
+  if (outcome === 'client_canceled') return '客户端取消'
+  return '未知'
+}
+
+function outcomeTone(outcome: string): string {
+  if (outcome === 'completed') return 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300'
+  if (outcome === 'error') return 'bg-red-500/12 text-red-700 dark:text-red-300'
+  if (outcome === 'client_canceled') return 'bg-amber-500/12 text-amber-700 dark:text-amber-300'
   return 'bg-muted text-muted-foreground'
+}
+
+function httpStatus(status: number): string {
+  return status > 0 ? String(status) : '未提交'
+}
+
+function displayedTokens(value: number, complete: boolean): string {
+  if (complete) return compact(value)
+  return value > 0 ? `${compact(value)}+` : '—'
+}
+
+function detailedTokens(value: number, complete: boolean): string {
+  if (complete) return formatInteger(value)
+  return value > 0 ? `${formatInteger(value)}（至少）` : '未知'
 }
 
 function MetricCard({ label, value, hint, tone }: { label: string; value: string; hint: string; tone?: string }) {
@@ -183,7 +209,7 @@ function App() {
   const [theme, setTheme] = useState<Theme>(savedTheme)
   const [stats, setStats] = useState<Stats | null>(null)
   const [logs, setLogs] = useState<LogList>({ items: [], total: 0, limit: PAGE_SIZE, offset: 0 })
-  const [filters, setFilters] = useState<Filters>({ model: '', upstream: '', protocol: '', status: '', errorsOnly: false })
+  const [filters, setFilters] = useState<Filters>({ model: '', upstream: '', protocol: '', status: '', outcome: '' })
   const [modelOptions, setModelOptions] = useState<string[]>([])
   const [upstreamOptions, setUpstreamOptions] = useState<string[]>([])
   const [statusOptions, setStatusOptions] = useState<string[]>([])
@@ -244,9 +270,9 @@ function App() {
         const codes = new Set(current)
         let changed = false
         for (const { name } of nextStats.by_status) {
-          // Group status codes into "2xx", "4xx", "5xx" etc.
+          // Group submitted status codes into "2xx", "4xx", "5xx" etc.
           if (name) {
-            const group = name[0] + 'xx'
+            const group = name === '0' ? '0' : name[0] + 'xx'
             if (!codes.has(group)) {
               codes.add(group)
               changed = true
@@ -295,6 +321,7 @@ function App() {
 
   const currentFrom = logs.total === 0 ? 0 : logs.offset + 1
   const currentTo = Math.min(logs.offset + logs.items.length, logs.total)
+  const resolvedRequests = (stats?.success ?? 0) + (stats?.errors ?? 0)
 
   function applyFilters(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -354,11 +381,12 @@ function App() {
           </div>
         )}
 
-        <section className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-5" aria-label="日志统计">
-          <MetricCard label="总请求" value={formatInteger(stats?.total ?? 0)} hint="全部已记录请求" />
-          <MetricCard label="输入 Token" value={compact(stats?.input_tokens ?? 0)} hint={formatInteger(stats?.input_tokens ?? 0)} />
-          <MetricCard label="输出 Token" value={compact(stats?.output_tokens ?? 0)} hint={formatInteger(stats?.output_tokens ?? 0)} />
-          <MetricCard label="成功率" value={formatRate((stats?.total ?? 0) > 0 ? (stats?.success ?? 0) / (stats?.total ?? 1) : null)} hint={`${formatInteger(stats?.success ?? 0)} / ${formatInteger(stats?.total ?? 0)} 成功`} tone="text-emerald-700 dark:text-emerald-300" />
+        <section className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-6" aria-label="日志统计">
+          <MetricCard label="总请求" value={formatInteger(stats?.total ?? 0)} hint={(stats?.unknown ?? 0) > 0 ? `${formatInteger(stats?.unknown ?? 0)} 条历史结果未知` : '全部已记录请求'} />
+          <MetricCard label="输入 Token" value={compact(stats?.input_tokens ?? 0)} hint={(stats?.usage_incomplete ?? 0) > 0 ? `${formatInteger(stats?.input_tokens ?? 0)} · ${formatInteger(stats?.usage_incomplete ?? 0)} 条未完整` : formatInteger(stats?.input_tokens ?? 0)} />
+          <MetricCard label="输出 Token" value={compact(stats?.output_tokens ?? 0)} hint={(stats?.usage_incomplete ?? 0) > 0 ? `${formatInteger(stats?.output_tokens ?? 0)} · ${formatInteger(stats?.usage_incomplete ?? 0)} 条未完整` : formatInteger(stats?.output_tokens ?? 0)} />
+          <MetricCard label="成功率" value={formatRate(resolvedRequests > 0 ? (stats?.success ?? 0) / resolvedRequests : null)} hint={`${formatInteger(stats?.success ?? 0)} / ${formatInteger(resolvedRequests)} 已结算`} tone="text-emerald-700 dark:text-emerald-300" />
+          <MetricCard label="客户端取消" value={formatInteger(stats?.canceled ?? 0)} hint="不计成功或上游错误" tone="text-amber-700 dark:text-amber-300" />
           <MetricCard label="缓存命中率" value={formatRate((stats?.input_tokens ?? 0) > 0 ? stats?.cache_hit_rate ?? 0 : null)} hint={`${formatInteger(stats?.cached_tokens ?? 0)} / ${formatInteger(stats?.input_tokens ?? 0)} 缓存 Token`} tone="text-sky-700 dark:text-sky-300" />
         </section>
 
@@ -388,7 +416,7 @@ function App() {
               <label className="sr-only" htmlFor="status">状态码</label>
               <select id="status" className="glass-select w-full px-3 text-sm text-foreground outline-none" value={draftFilters.status} onChange={(event) => setDraftFilters((value) => ({ ...value, status: event.target.value }))}>
                 <option value="">所有状态码</option>
-                {statuses.map((status) => <option key={status} value={status}>{status}</option>)}
+                {statuses.map((status) => <option key={status} value={status}>{status === '0' ? '未提交' : status}</option>)}
               </select>
               <label className="sr-only" htmlFor="protocol">协议</label>
               <select id="protocol" className="glass-select w-full px-3 text-sm text-foreground outline-none" value={draftFilters.protocol} onChange={(event) => setDraftFilters((value) => ({ ...value, protocol: event.target.value }))}>
@@ -397,10 +425,14 @@ function App() {
                 <option value="responses">responses</option>
                 <option value="claude">claude</option>
               </select>
-              <label className="flex min-h-10 cursor-pointer items-center gap-2 whitespace-nowrap px-1 text-sm text-muted-foreground">
-                <input type="checkbox" checked={draftFilters.errorsOnly} onChange={(event) => setDraftFilters((value) => ({ ...value, errorsOnly: event.target.checked }))} />
-                仅错误
-              </label>
+              <label className="sr-only" htmlFor="outcome">结果</label>
+              <select id="outcome" className="glass-select w-full px-3 text-sm text-foreground outline-none" value={draftFilters.outcome} onChange={(event) => setDraftFilters((value) => ({ ...value, outcome: event.target.value }))}>
+                <option value="">所有结果</option>
+                <option value="completed">成功</option>
+                <option value="error">错误</option>
+                <option value="client_canceled">客户端取消</option>
+                <option value="unknown">未知</option>
+              </select>
               <Button className="min-h-10 sm:min-h-10" type="submit"><Search /> 筛选</Button>
             </form>
 
@@ -409,7 +441,7 @@ function App() {
                 <thead className="glass-divider border-b bg-white/18 text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground dark:bg-white/3">
                   <tr>
                     <th className="px-5 py-3 sm:px-6">时间</th>
-                    <th className="px-3 py-3">状态</th>
+                    <th className="px-3 py-3">结果 / HTTP</th>
                     <th className="px-3 py-3">输入 / 输出 / 缓存</th>
                     <th className="px-3 py-3">TPS</th>
                     <th className="px-3 py-3">模型</th>
@@ -423,8 +455,14 @@ function App() {
                     return (
                       <tr key={record.id} className="glass-row cursor-pointer" onClick={() => setSelectedLog(record)}>
                         <td className="px-5 py-3 align-top font-mono text-xs sm:px-6"><div>{time.date}</div><div className="mt-0.5 text-muted-foreground">{time.time}</div></td>
-                        <td className="px-3 py-3 align-top"><span className={`rounded-full px-2 py-1 text-xs font-semibold ${statusTone(record.status_code)}`} title={record.error}>{record.status_code}</span></td>
-                        <td className="px-3 py-3 align-top font-mono text-xs"><span>{compact(record.input_tokens)}</span><span className="px-1 text-muted-foreground">/</span><span>{compact(record.output_tokens)}</span><span className="px-1 text-muted-foreground">/</span><span className="text-muted-foreground">{compact(record.cached_tokens)}</span></td>
+                        <td className="px-3 py-3 align-top">
+                          <span className={`inline-block whitespace-nowrap rounded-full px-2 py-1 text-xs font-semibold ${outcomeTone(record.outcome)}`} title={record.error}>{outcomeLabel(record.outcome)}</span>
+                          <div className="mt-1 font-mono text-[0.7rem] text-muted-foreground">HTTP {httpStatus(record.status_code)}</div>
+                        </td>
+                        <td className="px-3 py-3 align-top font-mono text-xs">
+                          <div><span>{displayedTokens(record.input_tokens, record.usage_complete)}</span><span className="px-1 text-muted-foreground">/</span><span>{displayedTokens(record.output_tokens, record.usage_complete)}</span><span className="px-1 text-muted-foreground">/</span><span className="text-muted-foreground">{displayedTokens(record.cached_tokens, record.usage_complete)}</span></div>
+                          {!record.usage_complete && <div className="mt-1 text-[0.7rem] text-amber-700 dark:text-amber-300">usage 未完整</div>}
+                        </td>
                         <td className="px-3 py-3 align-top font-mono text-xs">{tokensPerSecond(record)} <span className="text-muted-foreground">tok/s</span></td>
                         <td className="max-w-56 truncate px-3 py-3 align-top font-mono text-xs" title={record.model}>{record.model || '—'}</td>
                         <td className="max-w-48 truncate px-3 py-3 align-top font-mono text-xs" title={record.upstream}>{record.upstream || '—'}</td>
@@ -465,9 +503,12 @@ function App() {
         <dl className="grid gap-x-6 gap-y-3 text-sm sm:grid-cols-[9rem_1fr]">
           <Detail label="request_id" value={selectedLog.request_id} />
           <Detail label="time" value={formatDateTime(selectedLog.timestamp)} />
-          <Detail label="status" value={`${selectedLog.status_code} · ${selectedLog.duration_ms} ms`} />
-          <Detail label="input tokens" value={formatInteger(selectedLog.input_tokens)} />
-          <Detail label="output tokens" value={formatInteger(selectedLog.output_tokens)} />
+          <Detail label="outcome" value={outcomeLabel(selectedLog.outcome)} />
+          <Detail label="status" value={`HTTP ${httpStatus(selectedLog.status_code)} · ${selectedLog.duration_ms} ms`} />
+          <Detail label="usage" value={selectedLog.usage_complete ? '完整' : '未完整'} />
+          <Detail label="input tokens" value={detailedTokens(selectedLog.input_tokens, selectedLog.usage_complete)} />
+          <Detail label="output tokens" value={detailedTokens(selectedLog.output_tokens, selectedLog.usage_complete)} />
+          <Detail label="cached tokens" value={detailedTokens(selectedLog.cached_tokens, selectedLog.usage_complete)} />
           <Detail label="TPS" value={tokensPerSecond(selectedLog)} />
           <Detail label="model" value={selectedLog.model || '—'} />
           <Detail label="upstream" value={`${selectedLog.upstream || '—'} (${selectedLog.provider || '—'})`} />

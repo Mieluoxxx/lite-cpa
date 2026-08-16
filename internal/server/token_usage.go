@@ -17,6 +17,10 @@ type tokenUsage struct {
 	cachedSeen   bool
 }
 
+func (u tokenUsage) complete() bool {
+	return u.inputSeen && u.outputSeen
+}
+
 func usageFromResponse(payload []byte) tokenUsage {
 	var usage tokenUsage
 	usage.mergePayload(payload)

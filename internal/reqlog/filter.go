@@ -35,8 +35,11 @@ func buildListWhere(f ListFilter, postgres bool) (string, []any) {
 		prefix := strings.TrimSuffix(f.Status, "xx")
 		add("CAST(status_code AS TEXT) LIKE $%d", prefix+"%")
 	}
+	if f.Outcome != "" {
+		add("outcome = $%d", f.Outcome)
+	}
 	if f.ErrorsOnly {
-		parts = append(parts, `(status_code >= 400 OR error != '')`)
+		parts = append(parts, `outcome = 'error'`)
 	}
 	if len(parts) == 0 {
 		return "", nil
