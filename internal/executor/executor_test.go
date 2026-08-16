@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -329,4 +330,144 @@ func TestExecuteResponsesInjectsModelVerbosity(t *testing.T) {
 	if got := gjson.GetBytes(body, "text.verbosity"); got.Exists() {
 		t.Fatalf("unconfigured model must not get verbosity; body=%s", body)
 	}
+}
+
+func TestEnsureResponsesTerminalConvertsStreamError(t *testing.T) {
+	chunks := make(chan StreamChunk, 8)
+	chunks <- StreamChunk{Payload: []byte("event: response.created\n")}
+	chunks <- StreamChunk{Payload: []byte(`data: {"type":"response.created","sequence_number":4,"response":{"id":"resp_1","object":"response","model":"gpt-5","status":"in_progress","output":[]}}` + "\n")}
+	chunks <- StreamChunk{Payload: []byte("\n")}
+	chunks <- StreamChunk{Payload: []byte("event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":7,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"shell\",\"arguments\":\"{}\"}}\n\n")}
+	chunks <- StreamChunk{Err: errors.New("unexpected EOF")}
+	close(chunks)
+
+	guarded := ensureResponsesTerminal(context.Background(), &StreamResult{Status: http.StatusOK, Chunks: chunks}, "gpt-5")
+	body, logErrors, streamErrors := collectStream(t, guarded)
+	if !strings.Contains(body, "response.output_item.done") {
+		t.Fatalf("semantic event was not preserved: %q", body)
+	}
+	if got := strings.Count(body, "event: response.failed\n"); got != 1 {
+		t.Fatalf("response.failed count = %d, want 1; body=%q", got, body)
+	}
+	payload := responseFailedPayload(t, body)
+	if got := gjson.Get(payload, "sequence_number").Int(); got != 8 {
+		t.Fatalf("sequence_number = %d, want 8; payload=%s", got, payload)
+	}
+	if got := gjson.Get(payload, "response.id").String(); got != "resp_1" {
+		t.Fatalf("response.id = %q, want resp_1; payload=%s", got, payload)
+	}
+	if got := gjson.Get(payload, "response.status").String(); got != "failed" {
+		t.Fatalf("response.status = %q, want failed; payload=%s", got, payload)
+	}
+	if got := gjson.Get(payload, "response.error.code").String(); got != "server_error" {
+		t.Fatalf("response.error.code = %q, want server_error; payload=%s", got, payload)
+	}
+	if len(logErrors) != 1 || logErrors[0] != "unexpected EOF" {
+		t.Fatalf("log errors = %#v, want unexpected EOF", logErrors)
+	}
+	if len(streamErrors) != 0 {
+		t.Fatalf("stream errors = %#v, want none after response.failed", streamErrors)
+	}
+}
+
+func TestEnsureResponsesTerminalConvertsCleanEOF(t *testing.T) {
+	chunks := make(chan StreamChunk, 1)
+	chunks <- StreamChunk{Payload: []byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_clean\",\"status\":\"in_progress\"}}\n\n")}
+	close(chunks)
+
+	guarded := ensureResponsesTerminal(context.Background(), &StreamResult{Status: http.StatusOK, Chunks: chunks}, "gpt-5")
+	body, logErrors, streamErrors := collectStream(t, guarded)
+	if got := strings.Count(body, "event: response.failed\n"); got != 1 {
+		t.Fatalf("response.failed count = %d, want 1; body=%q", got, body)
+	}
+	if len(logErrors) != 1 || logErrors[0] != responsesMissingTerminalError {
+		t.Fatalf("log errors = %#v, want %q", logErrors, responsesMissingTerminalError)
+	}
+	if len(streamErrors) != 0 {
+		t.Fatalf("stream errors = %#v, want none", streamErrors)
+	}
+}
+
+func TestEnsureResponsesTerminalDoesNotDuplicateTerminalEvents(t *testing.T) {
+	for _, terminalType := range []string{"response.completed", "response.incomplete", "response.failed"} {
+		t.Run(terminalType, func(t *testing.T) {
+			chunks := make(chan StreamChunk, 2)
+			chunks <- StreamChunk{Payload: []byte("event: " + terminalType + "\ndata: {\"type\":\"" + terminalType + "\",\"sequence_number\":2,\"response\":{\"id\":\"resp_terminal\",\"status\":\"completed\"}}\n\n")}
+			chunks <- StreamChunk{Err: errors.New("unexpected EOF")}
+			close(chunks)
+
+			guarded := ensureResponsesTerminal(context.Background(), &StreamResult{Status: http.StatusOK, Chunks: chunks}, "gpt-5")
+			body, _, streamErrors := collectStream(t, guarded)
+			wantFailed := 0
+			if terminalType == "response.failed" {
+				wantFailed = 1
+			}
+			if got := strings.Count(body, "event: response.failed\n"); got != wantFailed {
+				t.Fatalf("response.failed count = %d, want %d; body=%q", got, wantFailed, body)
+			}
+			if len(streamErrors) != 1 || streamErrors[0].Error() != "unexpected EOF" {
+				t.Fatalf("stream errors = %#v, want original EOF after terminal", streamErrors)
+			}
+		})
+	}
+}
+
+func TestEnsureResponsesTerminalDoesNotDuplicateExplicitError(t *testing.T) {
+	chunks := make(chan StreamChunk, 1)
+	chunks <- StreamChunk{Payload: []byte("event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"busy\"}\n\n")}
+	close(chunks)
+
+	guarded := ensureResponsesTerminal(context.Background(), &StreamResult{Status: http.StatusOK, Chunks: chunks}, "gpt-5")
+	body, _, _ := collectStream(t, guarded)
+	if strings.Contains(body, "event: response.failed\n") {
+		t.Fatalf("explicit error was followed by response.failed: %q", body)
+	}
+}
+
+func TestEnsureResponsesTerminalSkipsFailureAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	chunks := make(chan StreamChunk, 1)
+	chunks <- StreamChunk{Payload: []byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cancelled\"}}\n\n")}
+	close(chunks)
+
+	guarded := ensureResponsesTerminal(ctx, &StreamResult{Status: http.StatusOK, Chunks: chunks}, "gpt-5")
+	body, _, _ := collectStream(t, guarded)
+	if strings.Contains(body, "event: response.failed\n") {
+		t.Fatalf("canceled request received response.failed: %q", body)
+	}
+}
+
+func collectStream(t *testing.T, result *StreamResult) (string, []string, []error) {
+	t.Helper()
+	var body strings.Builder
+	var logErrors []string
+	var streamErrors []error
+	for chunk := range result.Chunks {
+		body.Write(chunk.Payload)
+		if chunk.LogError != "" {
+			logErrors = append(logErrors, chunk.LogError)
+		}
+		if chunk.Err != nil {
+			streamErrors = append(streamErrors, chunk.Err)
+		}
+	}
+	return body.String(), logErrors, streamErrors
+}
+
+func responseFailedPayload(t *testing.T, body string) string {
+	t.Helper()
+	const marker = "event: response.failed\ndata: "
+	start := strings.Index(body, marker)
+	if start < 0 {
+		t.Fatalf("missing response.failed event: %q", body)
+	}
+	payload := body[start+len(marker):]
+	if end := strings.IndexByte(payload, '\n'); end >= 0 {
+		payload = payload[:end]
+	}
+	if !gjson.Valid(payload) {
+		t.Fatalf("invalid response.failed payload: %q", payload)
+	}
+	return payload
 }

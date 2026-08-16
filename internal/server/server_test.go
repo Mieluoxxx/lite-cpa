@@ -717,6 +717,113 @@ func TestResponsesSameFormatStreamEventAssociation(t *testing.T) {
 	}
 }
 
+func TestResponsesStreamUnexpectedEOFEmitsFailedAndLogsCause(t *testing.T) {
+	translator.RegisterBuiltin()
+
+	var hitsMu sync.Mutex
+	hits := 0
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitsMu.Lock()
+		hits++
+		hitsMu.Unlock()
+		if !strings.HasSuffix(r.URL.Path, "/responses") {
+			http.NotFound(w, r)
+			return
+		}
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("upstream response writer does not support hijacking")
+			return
+		}
+		conn, rw, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("hijack upstream connection: %v", err)
+			return
+		}
+		body := "event: response.created\n" +
+			"data: {\"type\":\"response.created\",\"sequence_number\":1,\"response\":{\"id\":\"resp_cut\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"in_progress\",\"output\":[]}}\n\n" +
+			"event: response.output_item.done\n" +
+			"data: {\"type\":\"response.output_item.done\",\"sequence_number\":2,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"shell\",\"arguments\":\"{}\"}}\n\n"
+		_, _ = io.WriteString(rw, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+		_, _ = io.WriteString(rw, strconv.FormatInt(int64(len(body)), 16)+"\r\n"+body+"\r\n")
+		_ = rw.Flush()
+		_ = conn.Close() // Deliberately omit the terminating zero-length chunk.
+	}))
+	t.Cleanup(up.Close)
+
+	logger, err := reqlog.Open(config.RequestLogConfig{
+		Enabled: true, Backend: "sqlite", Retention: "1h",
+		SQLite: config.SQLiteLogConfig{Path: filepath.Join(t.TempDir(), "requests.db")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = logger.Close() })
+
+	port := freePort(t)
+	cfg := &config.Config{
+		Host: "127.0.0.1", Port: port, APIKeys: []string{"sk-test"}, RequestRetry: 2, MaxBodyBytes: 1 << 20,
+		OpenAIResponses: []config.Provider{{
+			Name: "truncated", BaseURL: up.URL + "/v1", APIKey: "sk-up",
+			Models: []config.ModelAlias{{Name: "gpt-5", Alias: "gpt-5"}},
+		}},
+	}
+	srv := server.New(cfg, logger)
+	go func() { _ = srv.ListenAndServe() }()
+	t.Cleanup(func() { _ = srv.Shutdown(t.Context()) })
+	baseURL := "http://127.0.0.1:" + strconv.Itoa(port)
+	waitHTTP(t, baseURL+"/healthz")
+
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/v1/responses", strings.NewReader(`{"model":"gpt-5","input":"hi","stream":true}`))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		t.Fatalf("read downstream stream: %v", readErr)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d body %s", resp.StatusCode, raw)
+	}
+	body := string(raw)
+	if !strings.Contains(body, "response.output_item.done") {
+		t.Fatalf("partial semantic output was not preserved: %q", body)
+	}
+	if got := strings.Count(body, "event: response.failed\n"); got != 1 {
+		t.Fatalf("response.failed count = %d, want 1; body=%q", got, body)
+	}
+	if !strings.Contains(body, `"response":{"id":"resp_cut"`) || !strings.Contains(body, `"status":"failed"`) {
+		t.Fatalf("response.failed did not preserve response identity: %q", body)
+	}
+	hitsMu.Lock()
+	gotHits := hits
+	hitsMu.Unlock()
+	if gotHits != 1 {
+		t.Fatalf("upstream hits = %d, want 1 after semantic output", gotHits)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		logs, listErr := logger.List(t.Context(), reqlog.ListFilter{Limit: 10})
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		for _, record := range logs.Items {
+			if record.Upstream == "truncated" && record.StatusCode == http.StatusOK && strings.Contains(record.Error, "unexpected EOF") {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("missing unexpected EOF request log: %#v", logs.Items)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestResponsesStreamOverloadRetriesAndLogsAttempt(t *testing.T) {
 	translator.RegisterBuiltin()
 	var badHits, goodHits int

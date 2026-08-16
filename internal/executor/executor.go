@@ -4,15 +4,19 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Mieluoxxx/lite-cpa/internal/httpx"
 	"github.com/Mieluoxxx/lite-cpa/internal/registry"
 	"github.com/Mieluoxxx/lite-cpa/internal/thinking"
 	"github.com/Mieluoxxx/lite-cpa/internal/translator"
+	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -82,17 +86,20 @@ func Execute(ctx context.Context, key registry.UpstreamKey, upstreamModel string
 	switch key.Provider {
 	case "openai":
 		if stream {
-			return executeOpenAIStream(ctx, key, from, to, baseModel, payload, translated)
+			result, err := executeOpenAIStream(ctx, key, from, to, baseModel, payload, translated)
+			return guardResponsesClientStream(ctx, from, baseModel, result, err)
 		}
 		return executeOpenAI(ctx, key, from, to, baseModel, payload, translated)
 	case "openai-response":
 		if stream {
-			return executeResponsesStream(ctx, key, from, to, baseModel, payload, translated)
+			result, err := executeResponsesStream(ctx, key, from, to, baseModel, payload, translated)
+			return guardResponsesClientStream(ctx, from, baseModel, result, err)
 		}
 		return executeResponses(ctx, key, from, to, baseModel, payload, translated)
 	case "claude":
 		if stream {
-			return executeClaudeStream(ctx, key, from, to, baseModel, payload, translated)
+			result, err := executeClaudeStream(ctx, key, from, to, baseModel, payload, translated)
+			return guardResponsesClientStream(ctx, from, baseModel, result, err)
 		}
 		return executeClaude(ctx, key, from, to, baseModel, payload, translated)
 	default:
@@ -542,6 +549,200 @@ func frameForClient(chunk []byte, client translator.Format) []byte {
 		out = append(out, '\n', '\n')
 		return out
 	}
+}
+
+const responsesMissingTerminalError = "upstream stream closed before a terminal response event"
+
+func guardResponsesClientStream(ctx context.Context, source translator.Format, model string, result *StreamResult, err error) (*StreamResult, error) {
+	if err != nil || result == nil || source != translator.FormatOpenAIResponse {
+		return result, err
+	}
+	return ensureResponsesTerminal(ctx, result, model), nil
+}
+
+func ensureResponsesTerminal(ctx context.Context, result *StreamResult, model string) *StreamResult {
+	out := make(chan StreamChunk, 16)
+	go func() {
+		defer close(out)
+		observer := responsesTerminalObserver{model: model}
+
+		send := func(chunk StreamChunk) bool {
+			select {
+			case out <- chunk:
+				return true
+			default:
+			}
+			select {
+			case out <- chunk:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+
+		for chunk := range result.Chunks {
+			if len(chunk.Payload) > 0 {
+				observer.observe(chunk.Payload)
+			}
+			if chunk.Err == nil {
+				if !send(chunk) {
+					return
+				}
+				continue
+			}
+
+			if len(chunk.Payload) > 0 || chunk.LogError != "" {
+				if !send(StreamChunk{Payload: chunk.Payload, LogError: chunk.LogError}) {
+					return
+				}
+			}
+			observer.finish()
+			if observer.needsFailure() && ctx.Err() == nil && !errors.Is(chunk.Err, context.Canceled) {
+				send(StreamChunk{Payload: observer.failureEvent(), LogError: chunk.Err.Error()})
+				return
+			}
+			send(StreamChunk{Err: chunk.Err})
+			return
+		}
+
+		observer.finish()
+		if observer.needsFailure() && ctx.Err() == nil {
+			send(StreamChunk{Payload: observer.failureEvent(), LogError: responsesMissingTerminalError})
+		}
+	}()
+
+	return &StreamResult{Status: result.Status, Headers: result.Headers, Chunks: out}
+}
+
+type responsesTerminalObserver struct {
+	pending       []byte
+	response      []byte
+	model         string
+	maxSequence   int64
+	hasSequence   bool
+	terminalSeen  bool
+	explicitError bool
+	parseDisabled bool
+}
+
+func (o *responsesTerminalObserver) observe(chunk []byte) {
+	if len(chunk) == 0 || o.parseDisabled {
+		return
+	}
+	normalized := bytes.ReplaceAll(chunk, []byte("\r\n"), []byte("\n"))
+	if len(o.pending)+len(normalized) > streamScanMax {
+		o.pending = nil
+		o.parseDisabled = true
+		return
+	}
+	o.pending = append(o.pending, normalized...)
+	for {
+		end := bytes.Index(o.pending, []byte("\n\n"))
+		if end < 0 {
+			return
+		}
+		o.observeEvent(o.pending[:end])
+		o.pending = append(o.pending[:0], o.pending[end+2:]...)
+	}
+}
+
+func (o *responsesTerminalObserver) finish() {
+	if len(bytes.TrimSpace(o.pending)) > 0 && !o.parseDisabled {
+		o.observeEvent(o.pending)
+	}
+	o.pending = nil
+}
+
+func (o *responsesTerminalObserver) observeEvent(frame []byte) {
+	eventName := ""
+	var data bytes.Buffer
+	for _, line := range bytes.Split(frame, []byte("\n")) {
+		trimmed := bytes.TrimSpace(line)
+		switch {
+		case bytes.HasPrefix(trimmed, []byte("event:")):
+			eventName = strings.TrimSpace(string(trimmed[len("event:"):]))
+		case bytes.HasPrefix(trimmed, []byte("data:")):
+			if data.Len() > 0 {
+				data.WriteByte('\n')
+			}
+			data.Write(bytes.TrimSpace(trimmed[len("data:"):]))
+		}
+	}
+
+	payload := data.Bytes()
+	eventType := gjson.GetBytes(payload, "type").String()
+	if eventType == "" {
+		eventType = eventName
+	}
+	if sequence := gjson.GetBytes(payload, "sequence_number"); sequence.Exists() {
+		value := sequence.Int()
+		if !o.hasSequence || value > o.maxSequence {
+			o.maxSequence = value
+			o.hasSequence = true
+		}
+	}
+
+	if eventType == "response.created" {
+		response := gjson.GetBytes(payload, "response")
+		if response.IsObject() {
+			o.response = append(o.response[:0], response.Raw...)
+		}
+	}
+	switch eventType {
+	case "response.completed", "response.incomplete", "response.failed":
+		o.terminalSeen = true
+	case "error", "response.error":
+		o.explicitError = true
+	}
+	if eventName == "error" || eventName == "response.error" {
+		o.explicitError = true
+	}
+}
+
+func (o *responsesTerminalObserver) needsFailure() bool {
+	return !o.terminalSeen && !o.explicitError && !o.parseDisabled
+}
+
+func (o *responsesTerminalObserver) failureEvent() []byte {
+	response := bytes.Clone(o.response)
+	if !json.Valid(response) || !gjson.ParseBytes(response).IsObject() {
+		response = []byte(`{}`)
+	}
+	if gjson.GetBytes(response, "id").String() == "" {
+		response, _ = sjson.SetBytes(response, "id", "resp_"+strings.ReplaceAll(uuid.NewString(), "-", ""))
+	}
+	response, _ = sjson.SetBytes(response, "object", "response")
+	if !gjson.GetBytes(response, "created_at").Exists() {
+		response, _ = sjson.SetBytes(response, "created_at", time.Now().Unix())
+	}
+	if gjson.GetBytes(response, "model").String() == "" && o.model != "" {
+		response, _ = sjson.SetBytes(response, "model", o.model)
+	}
+	if output := gjson.GetBytes(response, "output"); !output.Exists() || !output.IsArray() {
+		response, _ = sjson.SetRawBytes(response, "output", []byte(`[]`))
+	}
+	response, _ = sjson.SetBytes(response, "status", "failed")
+	response, _ = sjson.SetRawBytes(response, "error", []byte(`{"code":"server_error","message":"Upstream stream ended before a terminal response event."}`))
+	if !gjson.GetBytes(response, "incomplete_details").Exists() {
+		response, _ = sjson.SetRawBytes(response, "incomplete_details", []byte(`null`))
+	}
+	if !gjson.GetBytes(response, "usage").Exists() {
+		response, _ = sjson.SetRawBytes(response, "usage", []byte(`null`))
+	}
+
+	sequence := int64(0)
+	if o.hasSequence {
+		sequence = o.maxSequence + 1
+	}
+	payload := []byte(`{"type":"response.failed","sequence_number":0,"response":{}}`)
+	payload, _ = sjson.SetBytes(payload, "sequence_number", sequence)
+	payload, _ = sjson.SetRawBytes(payload, "response", response)
+
+	framed := make([]byte, 0, len(payload)+32)
+	framed = append(framed, "event: response.failed\ndata: "...)
+	framed = append(framed, payload...)
+	framed = append(framed, '\n', '\n')
+	return framed
 }
 
 func streamPassthrough(ctx context.Context, resp *http.Response) (*StreamResult, error) {
