@@ -34,20 +34,20 @@ Based on [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) by Lu
 Copy-paste to your coding agent (Claude / Cursor / Codex / etc.):
 
 ```text
-Read https://github.com/Mieluoxxx/lite-cpa/blob/main/AGENTS.md and deploy lite-cpa on this machine using that document. Follow its "Configuring config.yaml" and "Deployment" sections: create config.yaml from config.example.yaml, fill gateway api-keys and at least one upstream provider, then start with docker compose (preferred) or a local binary. Prefer failover-mode key for official APIs and provider for relays. Verify with /healthz and one sample chat/completions request. Do not commit secrets.
+Read https://github.com/Mieluoxxx/lite-cpa/blob/main/AGENTS.md and deploy lite-cpa on this machine using that document. Follow its "Configuring config.yaml" and "Deployment" sections: create config/config.yaml from config/config.example.yaml, fill its gateway api-keys and at least one upstream provider, then start with docker compose (preferred) or a local binary. Prefer failover-mode key for official APIs and provider for relays. Verify with /healthz and one sample chat/completions request. Do not commit secrets.
 ```
 
 
 ## Quick start
 
 ```bash
-cp config.example.yaml config.yaml
-# edit api-keys and upstream credentials
+cp config/config.example.yaml config/config.yaml
+# edit config/config.yaml (api-keys and upstream credentials)
 
-go run ./cmd/lite-cpa --config config.yaml
+go run ./cmd/lite-cpa --config config/config.yaml
 
 go build -trimpath -ldflags='-s -w' -o lite-cpa ./cmd/lite-cpa
-./lite-cpa --config config.yaml
+./lite-cpa --config config/config.yaml
 ```
 
 ```bash
@@ -249,8 +249,8 @@ Process diagnostics still go to **stderr** only (not the DB).
 ## Docker
 
 ```bash
-cp config.example.yaml config.yaml
-# edit config.yaml
+cp config/config.example.yaml config/config.yaml
+# edit config/config.yaml
 
 docker compose up -d --build
 docker compose logs -f
@@ -259,7 +259,7 @@ docker compose down
 
 Mounts:
 
-- `./config.yaml` → `/app/config.yaml` (read-only)
+- `./config` → `/app/config` (read-only)
 - `./logs` → `/app/logs` (sqlite path when enabled)
 
 Listens on port `8317`. Default timezone `Asia/Shanghai` (`TZ`).
@@ -267,7 +267,7 @@ Listens on port `8317`. Default timezone `Asia/Shanghai` (`TZ`).
 ### Postgres backend (optional)
 
 1. Uncomment the `postgres` service in `docker-compose.yml`.
-2. Set in `config.yaml`:
+2. Set in `config/config.yaml`:
 
 ```yaml
 request-log:
@@ -286,7 +286,7 @@ request-log:
 ```bash
 docker build -t lite-cpa:local .
 docker run --rm -p 8317:8317 \
-  -v "$PWD/config.yaml:/app/config.yaml:ro" \
+  -v "$PWD/config:/app/config:ro" \
   -v "$PWD/logs:/app/logs" \
   lite-cpa:local
 ```

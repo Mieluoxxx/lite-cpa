@@ -6,7 +6,7 @@ lite-cpa is a slim Go gateway: protocol conversion among OpenAI Chat Completions
 
 - Keep the binary small and the hot path simple.
 - Prefer config-driven behavior over new code paths.
-- Comments and code identifiers: English. User-facing docs may be bilingual when the file already is (`README.md` / `README_zh.md`, `config.example.yaml`).
+- Comments and code identifiers: English. User-facing docs may be bilingual when the file already is (`README.md` / `README_zh.md`, `config/config.example.yaml`).
 - Do not invent OAuth / account sticky / Redis affinity unless explicitly requested.
 - After Go edits: `gofmt` and targeted `go test` on touched packages.
 
@@ -23,15 +23,15 @@ lite-cpa is a slim Go gateway: protocol conversion among OpenAI Chat Completions
 | `internal/translator/` | Format conversion (`chat` ↔ `responses` ↔ `claude`) |
 | `internal/config/` | YAML load, defaults, validation |
 | `internal/reqlog/` | Optional SQLite / Postgres request log |
-| `config.example.yaml` | Minimal scaffold (details live in this file) |
+| `config/config.example.yaml` | Minimal scaffold (details live in this file) |
 | `docs/Channel-Affinity-and-Retry.md` | Affinity + retry + failover (EN) |
 | `docs/渠道亲和与重试.md` | 亲和 + 重试 + 切换（中文） |
 
 ## Local commands
 
 ```bash
-cp config.example.yaml config.yaml   # then fill secrets
-go run ./cmd/lite-cpa --config config.yaml
+cp config/config.example.yaml config/config.yaml   # then fill secrets
+go run ./cmd/lite-cpa --config config/config.yaml
 go test ./internal/...
 go build -trimpath -ldflags='-s -w' -o lite-cpa ./cmd/lite-cpa
 ```
@@ -48,9 +48,9 @@ go build -trimpath -ldflags='-s -w' -o lite-cpa ./cmd/lite-cpa
 
 ---
 
-## Configuring `config.yaml`
+## Configuring `config/config.yaml`
 
-Copy `config.example.yaml` → `config.yaml`. **At least one** of `anthropic-messages`, `openai-responses`, `openai-completions` must be present with a valid key.
+Copy `config/config.example.yaml` → `config/config.yaml`. **At least one** of `anthropic-messages`, `openai-responses`, `openai-completions` must be present with a valid key.
 
 ### Top-level fields
 
@@ -255,15 +255,15 @@ anthropic-messages:
 ## Deployment
 
 Repository: https://github.com/Mieluoxxx/lite-cpa  
-Default listen: **8317**. Config path flag: `--config` (default used by Docker: `/app/config.yaml`).
+Default listen: **8317**. Config path flag: `--config` (default used by Docker: `/app/config/config.yaml`).
 
 ### Prerequisites
 
 1. Copy and edit config (never commit secrets):
 
 ```bash
-cp config.example.yaml config.yaml
-# set api-keys + at least one provider (see Configuring config.yaml)
+cp config/config.example.yaml config/config.yaml
+# set api-keys + at least one provider (in config/config.yaml; see Configuring config.yaml)
 ```
 
 2. Health check after start:
@@ -276,7 +276,7 @@ curl -sS http://127.0.0.1:8317/healthz
 
 ```bash
 go build -trimpath -ldflags='-s -w' -o lite-cpa ./cmd/lite-cpa
-./lite-cpa --config config.yaml
+./lite-cpa --config config/config.yaml
 ```
 
 Optional: run under systemd/supervisor; redirect stdout/stderr for process logs. Request DB (if enabled) is separate under `request-log`.
@@ -298,8 +298,8 @@ Invalid YAML or validation errors keep the previous config entirely and log `con
 ### Docker Compose (recommended)
 
 ```bash
-cp config.example.yaml config.yaml
-# edit config.yaml
+cp config/config.example.yaml config/config.yaml
+# edit config/config.yaml
 
 docker compose up -d --build
 docker compose logs -f
@@ -308,17 +308,17 @@ docker compose down
 
 | Host path | Container | Mode |
 |---|---|---|
-| `./config.yaml` | `/app/config.yaml` | read-only |
+| `./config` | `/app/config` | read-only |
 | `./logs` | `/app/logs` | rw (sqlite request-log) |
 
 - Image: multi-stage `golang:1.26-alpine` → `alpine:3.23`, non-root user `lite` (uid 10001).
 - Env: `TZ=Asia/Shanghai` (override as needed).
-- Config hot-reload: edit `config.yaml` in place (or `kill -HUP <pid>`). Providers / keys / models / affinity / `api-keys` / `request-retry` / `debug` / `max-body-bytes` apply without restart. `host`/`port` and request-log enable/backend/path/dsn/retention are ignored until restart (logged as a warning; the rest of that save still applies).
+- Config hot-reload: edit `config/config.yaml` in place (or `kill -HUP <pid>`). Providers / keys / models / affinity / `api-keys` / `request-retry` / `debug` / `max-body-bytes` apply without restart. `host`/`port` and request-log enable/backend/path/dsn/retention are ignored until restart (logged as a warning; the rest of that save still applies).
 #### Optional Postgres for request-log
 
 1. Uncomment the `postgres` service in `docker-compose.yml`.
 2. Uncomment `depends_on` on `lite-cpa`.
-3. In `config.yaml`:
+3. In `config/config.yaml`:
 
 ```yaml
 request-log:
@@ -336,12 +336,12 @@ request-log:
 docker build -t lite-cpa:local .
 docker run --rm -p 8317:8317 \
   -e TZ=Asia/Shanghai \
-  -v "$PWD/config.yaml:/app/config.yaml:ro" \
+  -v "$PWD/config:/app/config:ro" \
   -v "$PWD/logs:/app/logs" \
   lite-cpa:local
 ```
 
-Entrypoint: `lite-cpa --config /app/config.yaml`.
+Entrypoint: `lite-cpa --config /app/config/config.yaml`.
 
 ### Reverse proxy notes
 
@@ -351,7 +351,7 @@ Entrypoint: `lite-cpa --config /app/config.yaml`.
 
 ### Checklist
 
-- [ ] `config.yaml` has gateway `api-keys` and ≥1 upstream provider
+- [ ] `config/config.yaml` has gateway `api-keys` and ≥1 upstream provider
 - [ ] Official vs relay: `failover-mode` set (`key` vs `provider`)
 - [ ] `curl /healthz` and one real model call succeed
 - [ ] Logs: process → stderr; optional request-log → sqlite/postgres path

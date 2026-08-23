@@ -6,7 +6,7 @@ services:
     ports:
       - "8317:8317"
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
+      - ./config:/app/config:ro
       - ./logs:/app/logs
     environment:
       - TZ=Asia/Shanghai

@@ -1,6 +1,7 @@
 lite-cpa
 *.exe
 config.yaml
+config/config.yaml
 logs/
 .git/
 .DS_Store

@@ -1,0 +1,148 @@
+# lite-cpa example configuration / lite-cpa 示例配置
+# Full field reference: AGENTS.md → "Configuring config.yaml"
+# 完整字段说明见 AGENTS.md「Configuring config.yaml」
+#
+# cp config.example.yaml config.yaml
+# Enable at least one provider section below.
+# 至少启用下面一类 upstream。
+#
+# Provider sections are plain terse lists. Each upstream entry is a `- name:`
+# item; uncomment (or add) entries to enable them. The four sections are:
+#   anthropic-messages    -> upstream Anthropic /v1/messages         (type claude)
+#   openai-responses      -> upstream OpenAI /responses              (openai-response)
+#   openai-completions    -> upstream OpenAI-compatible /chat/completions (openai)
+#   openai-images         -> upstream OpenAI Images API passthrough (no translation)
+
+host: ""
+port: 8317
+
+api-keys:
+  - "sk-lite-gateway"
+
+request-retry: 2
+debug: false
+
+# Affinity on by default (TTL 600s, skip-retry false). Details in AGENTS.md.
+# 亲和默认开启（TTL 600s，失败可换 key）。详见 AGENTS.md。
+channel-affinity: [claude, gpt, gemini, grok, glm, kimi, qwen, minimax]
+# channel-affinity: false
+
+request-log:
+  enabled: false
+  backend: "sqlite"          # sqlite | postgres
+  retention: "168h"
+  store-body: false
+  sqlite:
+    path: "logs/requests.db"
+  # postgres:
+  #   dsn: "postgres://litecpa:litecpa@postgres:5432/litecpa?sslmode=disable"
+
+# --- Provider field order / 字段顺序 ---
+#   name → proxy-url → priority → failover-mode → headers → base-url → api-key → models
+# Only the fields you need are required; the rest use sane defaults.
+# 只有必需字段要填，其余用默认值。
+
+# --- failover-mode ---
+#   key      (default) official multi-key; 401/403/429/>=500 + network errors retry
+#   provider          relay / 中转站: one failure skips all keys under this name
+# Aliases: keys -> key; supplier/site -> provider.
+
+# --- models[].speed / models[].verbosity ---
+#   speed: "fast"   model-scoped fast tier. Anthropic adds speed + fast-mode beta;
+#                   OpenAI adds service_tier: priority. Empty blocks client fast tiers.
+#   verbosity: "low" | "medium" | "high"  (GPT-5 series, injected as text.verbosity
+#                   only when the client did not set it). Responses-API upstreams only.
+# Configure only against upstreams that support their native fast tier.
+#
+# --- models[].alias (optional) ---
+#   Client-visible id; defaults to name when omitted. Usually you just write
+#   `name` and skip alias entirely — only set alias when the client-facing model
+#   id differs from the upstream name.
+#   客户端可见 id；省略时默认等于 name。一般只写 name，仅当客户端 id 与上游名
+#   不一致时才设置 alias。
+
+# ────────────────────────────────────────────────────────────────
+# Example entries (comment the whole `- name:` block to disable a provider).
+# 下面是示例条目（禁用某 provider 时把整块 `- name:` 注释掉）。
+
+# anthropic-messages:
+#   - name: "anthropic-official"
+#     proxy-url: ""
+#     priority: 0
+#     failover-mode: "key"
+#     headers:
+#       User-Agent: "claude-cli/2.1.63 (external, cli)"
+#     base-url: "https://api.anthropic.com"
+#     api-key: "sk-ant-your-key"
+#     models:
+#       - name: "claude-sonnet-4"
+
+# openai-responses:
+#   - name: "openai-official"
+#     proxy-url: ""
+#     priority: 0
+#     failover-mode: "key"
+#     headers:
+#       User-Agent: "codex_cli_rs/0.144.1"
+#     base-url: "https://api.openai.com/v1"
+#     api-key: "sk-openai-official-key"
+#     models:
+#       - name: "gpt-5-sol"
+#         speed: "fast"
+#         verbosity: "low"
+#
+#   - name: "isok"
+#     proxy-url: ""
+#     priority: 1
+#     failover-mode: "provider"        # one site down => skip all its keys
+#     headers:
+#       User-Agent: "codex_cli_rs/0.144.1"
+#     base-url: "https://ai.isok.dev/v1"
+#     api-key-entries:
+#       - api-key: "sk-isok-1"
+#         priority: 0
+#       - api-key: "sk-isok-2"
+#         priority: 0
+#     models:
+#       - name: "gpt-5-sol"
+#         speed: "fast"
+#         verbosity: "low" # gpt 专用字段
+#       - name: "gpt-5-luna"
+#         speed: "fast"
+#         verbosity: "low" # gpt 专用字段
+
+# openai-completions:
+#   - name: "deepseek-official"
+#     proxy-url: ""
+#     priority: 0
+#     failover-mode: "key"
+#     headers:
+#       User-Agent: "curl/8.7.1"
+#     base-url: "https://api.deepseek.com/v1"
+#     api-key-entries:
+#       - api-key: "sk-deepseek-key-1"
+#         priority: 0
+#       - api-key: "sk-deepseek-key-2"
+#         priority: 0
+#     models:
+#       - name: "deepseek-chat"
+#
+#     # Simple single-key alternative — api-key-entries wins when non-empty:
+#     # api-key: "sk-deepseek-key"
+
+# openai-images:
+#   # Upstream already speaks the standard OpenAI Images API
+#   # (/v1/images/generations, /v1/images/edits). lite-cpa forwards the request
+#   # verbatim — JSON or multipart, no translation — and reuses the selector,
+#   # affinity, retry, request-log and token-usage plumbing. Use a higher
+#   # max-body-bytes if you proxy large multi-image edits.
+#   - name: "image-upstream"
+#     proxy-url: ""
+#     priority: 0
+#     failover-mode: "provider"
+#     headers:
+#       User-Agent: "codex_cli_rs/0.144.1"
+#     base-url: "https://api.example-image.dev/v1"
+#     api-key: "sk-image-key"
+#     models:
+#       - name: "gpt-image-2"

@@ -34,20 +34,20 @@
 复制下面这段给编程助手（Claude / Cursor / Codex 等）：
 
 ```text
-请阅读 https://github.com/Mieluoxxx/lite-cpa/blob/main/AGENTS.md ，并按该文档在本机部署 lite-cpa。严格遵循其中的「Configuring config.yaml」与「Deployment」：从 config.example.yaml 生成 config.yaml，填写网关 api-keys 与至少一个上游 provider，优先用 docker compose 启动（或本地二进制）。官方 API 用 failover-mode: key，中转站用 provider。
+请阅读 https://github.com/Mieluoxxx/lite-cpa/blob/main/AGENTS.md ，并按该文档在本机部署 lite-cpa。严格遵循其中的「Configuring config.yaml」与「Deployment」：从 config/config.example.yaml 生成 config/config.yaml，填写网关 api-keys 与至少一个上游 provider，优先用 docker compose 启动（或本地二进制）。官方 API 用 failover-mode: key，中转站用 provider。
 ```
 
 
 ## 快速开始
 
 ```bash
-cp config.example.yaml config.yaml
-# 填写 api-keys 与上游凭证
+cp config/config.example.yaml config/config.yaml
+# 填写 config/config.yaml 的 api-keys 与上游凭证
 
-go run ./cmd/lite-cpa --config config.yaml
+go run ./cmd/lite-cpa --config config/config.yaml
 
 go build -trimpath -ldflags='-s -w' -o lite-cpa ./cmd/lite-cpa
-./lite-cpa --config config.yaml
+./lite-cpa --config config/config.yaml
 ```
 
 ```bash
@@ -249,8 +249,8 @@ channel-affinity: [claude, gpt, grok]
 ## Docker
 
 ```bash
-cp config.example.yaml config.yaml
-# 编辑 config.yaml
+cp config/config.example.yaml config/config.yaml
+# 编辑 config/config.yaml
 
 docker compose up -d --build
 docker compose logs -f
@@ -259,7 +259,7 @@ docker compose down
 
 挂载：
 
-- `./config.yaml` → `/app/config.yaml`（只读）
+- `./config` → `/app/config`（只读）
 - `./logs` → `/app/logs`（启用 sqlite 时）
 
 监听 `8317`。默认时区 `Asia/Shanghai`（`TZ`）。
@@ -267,7 +267,7 @@ docker compose down
 ### Postgres 后端（可选）
 
 1. 在 `docker-compose.yml` 取消注释 `postgres` 服务。
-2. 在 `config.yaml` 中设置：
+2. 在 `config/config.yaml` 中设置：
 
 ```yaml
 request-log:
@@ -286,7 +286,7 @@ request-log:
 ```bash
 docker build -t lite-cpa:local .
 docker run --rm -p 8317:8317 \
-  -v "$PWD/config.yaml:/app/config.yaml:ro" \
+  -v "$PWD/config:/app/config:ro" \
   -v "$PWD/logs:/app/logs" \
   lite-cpa:local
 ```

@@ -13,11 +13,11 @@ RUN apk add --no-cache ca-certificates tzdata \
   && adduser -D -H -u 10001 lite
 WORKDIR /app
 COPY --from=build /out/lite-cpa /usr/local/bin/lite-cpa
-COPY config.example.yaml /app/config.example.yaml
+COPY config/config.example.yaml /app/config/config.example.yaml
 RUN mkdir -p /app/logs /app/data && chown -R lite:lite /app
 USER lite
 ENV TZ=Asia/Shanghai
 EXPOSE 8317
 VOLUME ["/app/logs", "/app/data"]
 ENTRYPOINT ["lite-cpa"]
-CMD ["--config", "/app/config.yaml"]
+CMD ["--config", "/app/config/config.yaml"]
