@@ -3,8 +3,8 @@ package claude
 import (
 	"context"
 
-	respchat "github.com/Mieluoxxx/lite-cpa/internal/translator/responses/chat"
 	chattoclaude "github.com/Mieluoxxx/lite-cpa/internal/translator/chat/claude"
+	respchat "github.com/Mieluoxxx/lite-cpa/internal/translator/responses/chat"
 )
 
 // hopState holds separate translator state for each hop:

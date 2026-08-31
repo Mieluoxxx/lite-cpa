@@ -1,8 +1,8 @@
 package responses
 
 import (
-	claudechat "github.com/Mieluoxxx/lite-cpa/internal/translator/claude/chat"
 	chatresp "github.com/Mieluoxxx/lite-cpa/internal/translator/chat/responses"
+	claudechat "github.com/Mieluoxxx/lite-cpa/internal/translator/claude/chat"
 )
 
 // ConvertClaudeRequestToOpenAIResponses converts Claude Messages → standard OpenAI Responses

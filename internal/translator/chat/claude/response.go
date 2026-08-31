@@ -6,7 +6,6 @@
 package claude
 
 import (
-
 	"github.com/Mieluoxxx/lite-cpa/internal/translator/common"
 
 	"bytes"
@@ -18,8 +17,7 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-var (
-)
+var ()
 
 // ConvertOpenAIResponseToAnthropicParams holds parameters for response conversion
 type ConvertOpenAIResponseToAnthropicParams struct {

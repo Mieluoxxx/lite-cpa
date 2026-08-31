@@ -41,7 +41,6 @@ type claudeToResponsesState struct {
 	UsageSeen    bool
 }
 
-
 func pickRequestJSON(originalRequestRawJSON, requestRawJSON []byte) []byte {
 	if len(originalRequestRawJSON) > 0 && gjson.ValidBytes(originalRequestRawJSON) {
 		return originalRequestRawJSON

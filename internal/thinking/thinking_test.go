@@ -34,9 +34,9 @@ func TestApplyThinkingClaudeSuffix(t *testing.T) {
 			model: "claude-opus-4-8(high)",
 			body:  `{"model":"claude-opus-4-8","temperature":0}`,
 			want: map[string]string{
-				"thinking.type":       "adaptive",
+				"thinking.type":        "adaptive",
 				"output_config.effort": "high",
-				"temperature":         "1",
+				"temperature":          "1",
 			},
 			absent: []string{"thinking.budget_tokens"},
 		},

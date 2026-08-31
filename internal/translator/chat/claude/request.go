@@ -13,9 +13,9 @@ import (
 	"math/big"
 	"strings"
 
-	"github.com/google/uuid"
 	"github.com/Mieluoxxx/lite-cpa/internal/registry"
 	"github.com/Mieluoxxx/lite-cpa/internal/thinking"
+	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )

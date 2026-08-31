@@ -6,7 +6,6 @@
 package chat
 
 import (
-
 	"github.com/Mieluoxxx/lite-cpa/internal/translator/common"
 
 	"bytes"
@@ -19,8 +18,7 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-var (
-)
+var ()
 
 // ConvertAnthropicResponseToOpenAIParams holds parameters for response conversion
 type ConvertAnthropicResponseToOpenAIParams struct {
