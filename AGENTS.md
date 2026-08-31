@@ -157,7 +157,7 @@ channel-affinity:
    - Product: `X-Claude-Code-Session-Id`, `x-opencode-session`, `x-session-affinity` (MiMo / OpenCode / Pi)
    - Codex / Pi: `session-id` / `session_id`, `thread-id` / `thread_id`, `Conversation_id`
    - Generic: `X-Session-Id`; parent: `x-parent-session-id`; Amp: `X-Amp-Thread-Id`
-   - Weak / last: `X-Client-Request-Id` (Pi; Codex may be per-request)
+   - Weak / last: `X-Client-Request-Id` (Pi; Codex may be per-request) — deferred behind body/custom sources; weak-only pins capped to a 60s TTL
 2. Protocol body by path:
    - `/v1/messages` → `metadata.user_id` (Claude/OpenCode formats normalized to session UUID) then `prompt_cache_key`
    - `/v1/responses` and chat completions → `prompt_cache_key` then `metadata.user_id`

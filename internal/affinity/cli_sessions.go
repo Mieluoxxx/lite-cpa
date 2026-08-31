@@ -319,17 +319,40 @@ var sessionHeaderKeySet = func() map[string]struct{} {
 //	user_{hash}_account__session_{uuid}
 var claudeSessionPattern = regexp.MustCompile(`(?i)_session_([a-f0-9-]+)$`)
 
-// extractStickySessionHeader returns the first non-empty sticky session header.
-func extractStickySessionHeader(headers http.Header) (string, bool) {
+// weakStickySessionHeaders are sticky headers whose value may change per
+// request (catalog note: "Weak / sometimes per-request — keep last"). They are
+// deferred behind strong headers, protocol body fields and custom key sources,
+// and their pins are capped to a short TTL.
+var weakStickySessionHeaders = map[string]struct{}{
+	"x-client-request-id": {},
+}
+
+func isWeakStickySessionHeader(key string) bool {
+	_, ok := weakStickySessionHeaders[strings.ToLower(strings.TrimSpace(key))]
+	return ok
+}
+
+// extractStickySessionHeader returns the first sticky session header value.
+// Strong (stable multi-turn) headers win; a value from a weak header is
+// reported with weak=true and only consumed when no stronger identity exists.
+func extractStickySessionHeader(headers http.Header) (value string, weak bool, ok bool) {
 	if headers == nil {
-		return "", false
+		return "", false, false
 	}
 	for _, k := range StickySessionHeaders {
-		if v, ok := extractHeader(headers, k); ok {
-			return v, true
+		v, found := extractHeader(headers, k)
+		if !found {
+			continue
 		}
+		if isWeakStickySessionHeader(k) {
+			if value == "" {
+				value, weak, ok = v, true, true
+			}
+			continue
+		}
+		return v, false, true
 	}
-	return "", false
+	return value, weak, ok
 }
 
 // isStickySessionHeader reports whether key is a known sticky session header.

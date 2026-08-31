@@ -67,6 +67,7 @@ func New(cfg *config.Config, logger *reqlog.Logger) *Server {
 	mux.HandleFunc("GET /api/logs", s.handleLogsList)
 	mux.HandleFunc("DELETE /api/logs", s.handleLogsClear)
 	mux.HandleFunc("GET /api/logs/stats", s.handleLogsStats)
+	mux.HandleFunc("GET /api/affinity/stats", s.handleAffinityStats)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("POST /v1/responses", s.handleResponses)
@@ -359,8 +360,24 @@ func (s *Server) forward(
 	tried := make(map[string]struct{})
 	skipSuppliers := make(map[string]struct{})
 	preferSupplier := ""
+	// Resolve the sticky (preferred) key once. Skip-retry only applies when the
+	// pinned key is actually usable: after a reload it may have vanished, and
+	// the request then falls back to normal selection with a full retry budget.
+	var preferredKey registry.UpstreamKey
+	preferredUsable := false
+	if aff.Found {
+		if _, keys, ok := s.reg.Resolve(resolveName); ok {
+			if k, ok := affinity.ResolvePreferred(keys, aff.KeyID, tried); ok {
+				preferredKey = k
+				preferredUsable = true
+			}
+		}
+	}
+	if aff.Found && !preferredUsable {
+		s.affinity.MarkPreferredUnavailable()
+	}
 	maxAttempts := s.selector.MaxAttempts(resolveName)
-	if aff.Found && aff.SkipRetry {
+	if preferredUsable && aff.SkipRetry {
 		maxAttempts = 1
 	}
 	var lastErr error
@@ -371,19 +388,15 @@ func (s *Server) forward(
 		var upstreamModel string
 		var pickErr error
 
-		if attempt == 0 && aff.Found {
-			if _, keys, ok := s.reg.Resolve(resolveName); ok {
-				if preferred, ok := affinity.ResolvePreferred(keys, aff.KeyID, tried); ok {
-					key = preferred
-					upstreamModel = resolveName
-					if preferred.Headers != nil {
-						if m := preferred.Headers["x-lite-upstream-model"]; m != "" {
-							upstreamModel = m
-						}
-					}
-					preferSupplier = preferred.Name
+		if attempt == 0 && preferredUsable {
+			key = preferredKey
+			upstreamModel = resolveName
+			if preferredKey.Headers != nil {
+				if m := preferredKey.Headers["x-lite-upstream-model"]; m != "" {
+					upstreamModel = m
 				}
 			}
+			preferSupplier = preferredKey.Name
 		}
 		if key.ID == "" {
 			key, upstreamModel, pickErr = s.selector.Pick(resolveName, tried, preferSupplier, skipSuppliers)

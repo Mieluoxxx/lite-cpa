@@ -79,6 +79,14 @@ func (s *Server) handleLogsList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+func (s *Server) handleAffinityStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAPIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.affinity.Stats())
+}
+
 func (s *Server) handleLogsClear(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		writeAPIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")

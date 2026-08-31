@@ -304,6 +304,27 @@ func TestChannelAffinityStickyKey(t *testing.T) {
 			t.Fatalf("expected sticky key %q, hit[%d]=%q all=%v", first, i, h, hits)
 		}
 	}
+
+	// Stats endpoint reflects the sticky flow (counters only, no keys/values).
+	reqStats, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1:"+strconv.Itoa(port)+"/api/affinity/stats", nil)
+	reqStats.Header.Set("Authorization", "Bearer sk-test")
+	respStats, err := http.DefaultClient.Do(reqStats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer respStats.Body.Close()
+	rawStats, _ := io.ReadAll(respStats.Body)
+	if respStats.StatusCode != 200 {
+		t.Fatalf("stats status %d %s", respStats.StatusCode, rawStats)
+	}
+	var st map[string]float64
+	if err := json.Unmarshal(rawStats, &st); err != nil {
+		t.Fatalf("stats body %s", rawStats)
+	}
+	// 6 requests: first is a miss, the rest hit the pin.
+	if st["matched_lookups"] != 6 || st["cache_hits"] != 5 {
+		t.Fatalf("stats counters: %v", st)
+	}
 }
 func TestChannelAffinitySkipRetry(t *testing.T) {
 	translator.RegisterBuiltin()
@@ -381,6 +402,100 @@ func TestChannelAffinitySkipRetry(t *testing.T) {
 	// One sticky attempt only — no multi-key rotation.
 	if hits-before != 1 {
 		t.Fatalf("skip-retry should attempt sticky key once, delta=%d hits=%d", hits-before, hits)
+	}
+}
+
+func TestChannelAffinitySkipRetryWhenPinVanishes(t *testing.T) {
+	translator.RegisterBuiltin()
+	var hits int
+	var mu sync.Mutex
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		n := hits
+		mu.Unlock()
+		if n == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"boom"}`))
+	}))
+	t.Cleanup(up.Close)
+
+	affinityCfg := func() config.ChannelAffinitySetting {
+		return config.ChannelAffinitySetting{
+			Enabled: boolPtr(true),
+			Rules: []config.ChannelAffinityRule{{
+				Name: "sticky skip",
+				KeySources: []config.ChannelAffinityKeySource{
+					{Type: "gjson", Path: "metadata.user_id"},
+				},
+				SkipRetryOnFailure: true,
+			}},
+		}
+	}
+
+	port := freePort(t)
+	cfg := &config.Config{
+		Host: "127.0.0.1", Port: port, APIKeys: []string{"sk-test"}, RequestRetry: 3, MaxBodyBytes: 1 << 20,
+		ChannelAffinity: affinityCfg(),
+		OpenAICompletions: []config.Provider{{
+			Name: "mock", BaseURL: up.URL,
+			APIKeyEntries: []config.APIKeyEntry{{APIKey: "sk-a"}},
+			Models:        []config.ModelAlias{{Name: "m", Alias: "m"}},
+		}},
+	}
+	cfg.ChannelAffinity.MaxEntries = 100
+	srv := server.New(cfg, nil)
+	go func() { _ = srv.ListenAndServe() }()
+	t.Cleanup(func() { _ = srv.Shutdown(t.Context()) })
+	waitHTTP(t, "http://127.0.0.1:"+strconv.Itoa(port)+"/healthz")
+
+	do := func() int {
+		req, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+strconv.Itoa(port)+"/v1/chat/completions",
+			strings.NewReader(`{"model":"m","metadata":{"user_id":"u1"},"messages":[{"role":"user","content":"x"}]}`))
+		req.Header.Set("Authorization", "Bearer sk-test")
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode
+	}
+
+	// Warm: pin mock-0.
+	if status := do(); status != 200 {
+		t.Fatalf("warm status %d", status)
+	}
+
+	// Reload with the pinned key gone (provider renamed, fresh keys). The pin
+	// survives Reconfigure but no longer resolves — skip-retry must not clamp
+	// the retry budget of a request that will use a newly selected key.
+	next := &config.Config{
+		Host: "127.0.0.1", Port: port, APIKeys: []string{"sk-test"}, RequestRetry: 3, MaxBodyBytes: 1 << 20,
+		ChannelAffinity: affinityCfg(),
+		OpenAICompletions: []config.Provider{{
+			Name: "renamed", BaseURL: up.URL,
+			APIKeyEntries: []config.APIKeyEntry{{APIKey: "sk-b"}, {APIKey: "sk-c"}, {APIKey: "sk-d"}},
+			Models:        []config.ModelAlias{{Name: "m", Alias: "m"}},
+		}},
+	}
+	next.ChannelAffinity.MaxEntries = 100
+	if err := srv.Reload(next); err != nil {
+		t.Fatal(err)
+	}
+
+	before := hits
+	_ = do()
+	mu.Lock()
+	defer mu.Unlock()
+	// RequestRetry=3 with 3 keys → full rotation over all keys.
+	if delta := hits - before; delta != 3 {
+		t.Fatalf("vanished pin must keep full retry budget, delta=%d hits=%d", delta, hits)
 	}
 }
 

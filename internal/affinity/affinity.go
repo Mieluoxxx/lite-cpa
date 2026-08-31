@@ -1,11 +1,13 @@
 // Package affinity implements rule-based upstream key stickiness.
 //
 // Identity order:
-//  1. sticky session headers (see cli_sessions.go catalog)
+//  1. strong sticky session headers (see cli_sessions.go catalog)
 //  2. protocol body field by path:
 //     - /v1/messages → metadata.user_id (Claude-normalized)
 //     - /v1/responses or /chat/completions → prompt_cache_key
 //  3. remaining rule KeySources as fallback
+//  4. weak sticky headers (e.g. X-Client-Request-Id) as last resort — such
+//     values may change per request, so their pins use a short TTL
 //
 // Stickiness only engages when such a field is present. Storage is process-local.
 package affinity
@@ -35,6 +37,9 @@ type Match struct {
 	SkipRetry bool
 	TTL       time.Duration
 	RuleName  string
+	// Weak is true when the identity came from a weak source (e.g.
+	// X-Client-Request-Id); such pins are capped to weakPinTTL.
+	Weak bool
 }
 
 // Manager owns rule evaluation and the sticky cache.
@@ -51,6 +56,25 @@ type Manager struct {
 	approx          atomic.Int64
 	janitorOnce     sync.Once
 	stopJanitor     chan struct{}
+
+	// stats counters (hot path: atomics only)
+	stLookups  atomic.Int64 // rules that produced an identity (Matched=true)
+	stHits     atomic.Int64 // lookups that found a pinned key
+	stRecords  atomic.Int64 // pins written
+	stClears   atomic.Int64 // pins deleted
+	stPrefMiss atomic.Int64 // pins that existed but their key was unusable
+}
+
+// Stats is a point-in-time snapshot of affinity counters. Counters only —
+// no affinity values or cache keys are exposed.
+type Stats struct {
+	Entries          int64   `json:"entries"`
+	MatchedLookups   int64   `json:"matched_lookups"`
+	CacheHits        int64   `json:"cache_hits"`
+	HitRate          float64 `json:"hit_rate"`
+	Records          int64   `json:"records"`
+	Clears           int64   `json:"clears"`
+	PreferredUnavail int64   `json:"preferred_unavailable"`
 }
 
 type cacheEntry struct {
@@ -144,7 +168,7 @@ func (m *Manager) Lookup(model, path string, headers http.Header, body []byte) M
 		if len(rule.UserAgentInclude) > 0 && !matchAnyIncludeFold(rule.UserAgentInclude, ua) {
 			continue
 		}
-		value, ok := extractAffinityValue(rule.KeySources, path, headers, body)
+		value, weak, ok := extractAffinityValue(rule.KeySources, path, headers, body)
 		if !ok {
 			// no sticky identity field present → skip this rule
 			continue
@@ -156,6 +180,9 @@ func (m *Manager) Lookup(model, path string, headers http.Header, body []byte) M
 		if rule.TTLSeconds > 0 {
 			ttl = time.Duration(rule.TTLSeconds) * time.Second
 		}
+		if weak && ttl > weakPinTTL {
+			ttl = weakPinTTL
+		}
 		cacheKey := buildCacheKey(rule, model, value)
 		match := Match{
 			Matched:   true,
@@ -163,10 +190,13 @@ func (m *Manager) Lookup(model, path string, headers http.Header, body []byte) M
 			SkipRetry: rule.SkipRetryOnFailure,
 			TTL:       ttl,
 			RuleName:  rule.Name,
+			Weak:      weak,
 		}
+		m.stLookups.Add(1)
 		if keyID, found := m.get(cacheKey); found {
 			match.Found = true
 			match.KeyID = keyID
+			m.stHits.Add(1)
 		}
 		return match
 	}
@@ -190,6 +220,7 @@ func (m *Manager) Record(cacheKey, keyID string, ttl time.Duration) {
 		ttl = defaultTTL
 	}
 	m.set(cacheKey, keyID, ttl)
+	m.stRecords.Add(1)
 }
 
 // Clear drops a sticky binding (e.g. preferred key failed).
@@ -201,6 +232,7 @@ func (m *Manager) Clear(cacheKey string) {
 	if _, ok := m.entries[cacheKey]; ok {
 		delete(m.entries, cacheKey)
 		m.approx.Add(-1)
+		m.stClears.Add(1)
 	}
 	m.mu.Unlock()
 }
@@ -224,21 +256,29 @@ func ResolvePreferred(keys []registry.UpstreamKey, preferredID string, tried map
 	return registry.UpstreamKey{}, false
 }
 
+// weakPinTTL caps the pin lifetime for weak identity sources: their values may
+// change per request (e.g. X-Client-Request-Id on some clients), so a full-TTL
+// pin would flood the cache with one-shot keys.
+const weakPinTTL = 60 * time.Second
+
 // extractAffinityValue implements:
-//  1. sticky session headers first (CLI catalog)
+//  1. strong sticky session headers first (CLI catalog)
 //  2. protocol-native body field (by path, Claude user_id normalized)
 //  3. remaining configured key sources
+//  4. weak sticky headers (sometimes per-request values) as last resort
 //
 // Match only when a field is present (non-empty).
-func extractAffinityValue(sources []config.ChannelAffinityKeySource, path string, headers http.Header, body []byte) (string, bool) {
-	// 1) sticky session headers (CLI catalog priority)
-	if v, ok := extractStickySessionHeader(headers); ok {
-		return v, true
+func extractAffinityValue(sources []config.ChannelAffinityKeySource, path string, headers http.Header, body []byte) (value string, weak bool, ok bool) {
+	// 1) sticky session headers (CLI catalog priority); keep the first weak
+	// candidate around in case nothing stronger exists.
+	hdrValue, hdrWeak, hdrFound := extractStickySessionHeader(headers)
+	if hdrFound && !hdrWeak {
+		return hdrValue, false, true
 	}
 
 	// 2) protocol body field
-	if v, ok := extractProtocolBodyValue(path, body); ok {
-		return v, true
+	if v, found := extractProtocolBodyValue(path, body); found {
+		return v, false, true
 	}
 
 	// 3) configured sources (skip headers / body paths already tried)
@@ -252,8 +292,8 @@ func extractAffinityValue(sources []config.ChannelAffinityKeySource, path string
 			if isStickySessionHeader(src.Key) {
 				continue // already tried
 			}
-			if v, ok := extractHeader(headers, src.Key); ok {
-				return v, true
+			if v, found := extractHeader(headers, src.Key); found {
+				return v, false, true
 			}
 		case "gjson", "body":
 			if src.Path == "" {
@@ -262,20 +302,23 @@ func extractAffinityValue(sources []config.ChannelAffinityKeySource, path string
 			if _, done := triedBody[src.Path]; done {
 				continue
 			}
-			if v, ok := extractGJSON(body, src.Path); ok {
+			if v, found := extractGJSON(body, src.Path); found {
 				if src.Path == "metadata.user_id" {
-					return normalizeClaudeUserID(v)
+					if sid, ok := normalizeClaudeUserID(v); ok {
+						return sid, false, true
+					}
+					continue
 				}
-				return v, true
+				return v, false, true
 			}
 		}
 	}
-	return "", false
-}
 
-func extractValue(sources []config.ChannelAffinityKeySource, headers http.Header, body []byte) (string, bool) {
-	// legacy helper used by tests/tools: no path-aware protocol preference
-	return extractAffinityValue(sources, "", headers, body)
+	// 4) weak sticky header fallback (short-TTL pin upstream)
+	if hdrFound {
+		return hdrValue, true, true
+	}
+	return "", false, false
 }
 
 // protocolBodyPaths returns body gjson paths preferred for the request path.
@@ -470,4 +513,35 @@ func (m *Manager) Len() int {
 		return 0
 	}
 	return int(m.approx.Load())
+}
+
+// Stats returns a snapshot of the affinity counters.
+func (m *Manager) Stats() Stats {
+	if m == nil {
+		return Stats{}
+	}
+	lookups := m.stLookups.Load()
+	hits := m.stHits.Load()
+	rate := 0.0
+	if lookups > 0 {
+		rate = float64(hits) / float64(lookups)
+	}
+	return Stats{
+		Entries:          m.approx.Load(),
+		MatchedLookups:   lookups,
+		CacheHits:        hits,
+		HitRate:          rate,
+		Records:          m.stRecords.Load(),
+		Clears:           m.stClears.Load(),
+		PreferredUnavail: m.stPrefMiss.Load(),
+	}
+}
+
+// MarkPreferredUnavailable records that a pin existed but its key was not
+// usable (vanished after a reload, or already tried this request).
+func (m *Manager) MarkPreferredUnavailable() {
+	if m == nil {
+		return
+	}
+	m.stPrefMiss.Add(1)
 }

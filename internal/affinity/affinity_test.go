@@ -229,4 +229,91 @@ func TestDefaultFamiliesIncludeGrok(t *testing.T) {
 	}
 }
 
+func TestWeakHeaderDeferredToStrongHeader(t *testing.T) {
+	m := affinity.New(config.ChannelAffinitySetting{
+		Enabled: boolPtr(true),
+		Models:  []string{"gpt"},
+	})
+	t.Cleanup(m.Close)
+
+	h := http.Header{}
+	h.Set("Session-Id", "hdr-sess")
+	h.Set("X-Client-Request-Id", "req-1")
+	body := []byte(`{"prompt_cache_key":"body-pc"}`)
+	match := m.Lookup("gpt-5", "/v1/responses", h, body)
+	if !match.Matched || match.CacheKey != "gpt sticky:hdr-sess" || match.Weak {
+		t.Fatalf("strong header must beat weak header: %+v", match)
+	}
+}
+
+func TestWeakHeaderDeferredToBody(t *testing.T) {
+	m := affinity.New(config.ChannelAffinitySetting{
+		Enabled: boolPtr(true),
+		Models:  []string{"gpt"},
+	})
+	t.Cleanup(m.Close)
+
+	h := http.Header{}
+	h.Set("X-Client-Request-Id", "req-1")
+	body := []byte(`{"prompt_cache_key":"body-pc"}`)
+	match := m.Lookup("gpt-5", "/v1/responses", h, body)
+	if !match.Matched || match.CacheKey != "gpt sticky:body-pc" || match.Weak {
+		t.Fatalf("protocol body must beat weak header: %+v", match)
+	}
+}
+
+func TestWeakHeaderOnlyShortTTL(t *testing.T) {
+	m := affinity.New(config.ChannelAffinitySetting{
+		Enabled:           boolPtr(true),
+		DefaultTTLSeconds: 600,
+		Models:            []string{"gpt"},
+	})
+	t.Cleanup(m.Close)
+
+	h := http.Header{}
+	h.Set("X-Client-Request-Id", "req-1")
+	match := m.Lookup("gpt-5", "/v1/responses", h, []byte(`{}`))
+	if !match.Matched || !match.Weak {
+		t.Fatalf("weak-only identity must match: %+v", match)
+	}
+	if match.TTL != 60*time.Second {
+		t.Fatalf("weak pin TTL must be capped to 60s, got %v", match.TTL)
+	}
+	m.Record(match.CacheKey, "gpt-0", match.TTL)
+	if next := m.Lookup("gpt-5", "/v1/responses", h, []byte(`{}`)); !next.Found || next.KeyID != "gpt-0" {
+		t.Fatalf("weak pin should stick within TTL: %+v", next)
+	}
+}
+
+func TestStatsCounters(t *testing.T) {
+	m := affinity.New(config.ChannelAffinitySetting{
+		Enabled: boolPtr(true),
+		Models:  []string{"gpt"},
+	})
+	t.Cleanup(m.Close)
+
+	body := []byte(`{"prompt_cache_key":"pc-1"}`)
+	if match := m.Lookup("gpt-5", "/v1/responses", nil, body); !match.Matched || match.Found {
+		t.Fatalf("first lookup: %+v", match)
+	}
+	m.Record("gpt sticky:pc-1", "gpt-0", time.Minute)
+	if next := m.Lookup("gpt-5", "/v1/responses", nil, body); !next.Found || next.KeyID != "gpt-0" {
+		t.Fatalf("second lookup: %+v", next)
+	}
+	// rule matched but no identity field → not a matched lookup
+	if miss := m.Lookup("gpt-5", "/v1/responses", nil, []byte(`{}`)); miss.Matched {
+		t.Fatalf("no identity must not match: %+v", miss)
+	}
+	m.Clear("gpt sticky:pc-1")
+	m.MarkPreferredUnavailable()
+
+	st := m.Stats()
+	if st.MatchedLookups != 2 || st.CacheHits != 1 || st.Records != 1 || st.Clears != 1 || st.PreferredUnavail != 1 {
+		t.Fatalf("stats: %+v", st)
+	}
+	if st.HitRate != 0.5 || st.Entries != 0 {
+		t.Fatalf("rate=%v entries=%v", st.HitRate, st.Entries)
+	}
+}
+
 func boolPtr(v bool) *bool { return &v }

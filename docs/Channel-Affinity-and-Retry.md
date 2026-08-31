@@ -111,6 +111,8 @@ First non-empty header wins. Product-stable ids first; weak / sometimes per-requ
 
 `net/http` header matching is case-insensitive; both hyphenated and underscored spellings are listed because reverse proxies differ.
 
+Weak headers (`X-Client-Request-Id`) are deferred: they are only used when no strong header, protocol body field, or custom key source yields an identity, and pins made from a weak value are capped to a 60s TTL — the value may be per-request, so a full-TTL pin would flood the cache with one-shot keys.
+
 #### Protocol body (no session header)
 
 | Request path | Preferred body fields (in order) |
@@ -312,6 +314,8 @@ channel-affinity: true                    # or [claude, gpt, grok]
 ## Debugging
 
 With `debug: true`, stderr logs affinity hit / clear / record and rotation.
+
+`GET /api/affinity/stats` (gateway key required, same as `/api/logs`) returns counters only — `matched_lookups`, `cache_hits`, `hit_rate`, `records`, `clears`, `preferred_unavailable`, `entries`. No affinity values or cache keys are exposed.
 
 Request-log (optional) stores provider name and status; it does not yet store affinity fingerprint fields.
 
