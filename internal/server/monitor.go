@@ -87,6 +87,36 @@ func (s *Server) handleAffinityStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.affinity.Stats())
 }
 
+func (s *Server) handleRoutingStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAPIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
+		return
+	}
+	cfg := s.currentCfg()
+	strategy := "priority"
+	shadow := false
+	if cfg != nil {
+		strategy = cfg.Routing.Strategy
+		shadow = cfg.Routing.Shadow
+	}
+	if strings.TrimSpace(strategy) == "" {
+		strategy = "priority"
+	}
+	reason := "provider-priority, entry-priority, round-robin"
+	if strategy == "adaptive" && !shadow {
+		reason = "same-priority reliability, then round-robin"
+	} else if strategy == "adaptive" {
+		reason = "shadow-only; selection unchanged"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"strategy":               strategy,
+		"shadow":                 shadow,
+		"selection_reason":       reason,
+		"items":                  s.health.Snapshot(),
+		"shadow_recommendations": s.health.ShadowSnapshot(),
+	})
+}
+
 func (s *Server) handleLogsClear(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		writeAPIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")

@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,6 +37,7 @@ type Server struct {
 	cfg      *config.Config
 	reg      *registry.Registry
 	selector *pool.Selector
+	health   *pool.HealthState
 	affinity *affinity.Manager
 	auth     *access.Checker
 	logger   *reqlog.Logger
@@ -42,6 +46,7 @@ type Server struct {
 	maxBody atomic.Int64
 
 	reloadMu sync.Mutex
+	stateMu  sync.RWMutex
 }
 
 func New(cfg *config.Config, logger *reqlog.Logger) *Server {
@@ -49,10 +54,13 @@ func New(cfg *config.Config, logger *reqlog.Logger) *Server {
 		logger = &reqlog.Logger{}
 	}
 	reg := pool.BuildRegistry(cfg)
+	health := pool.NewHealthState()
+	health.ConfigureRouting(cfg.Routing.Strategy, cfg.Routing.HalfLifeDuration(), cfg.Routing.Shadow)
 	s := &Server{
 		cfg:      cfg,
 		reg:      reg,
-		selector: pool.NewSelector(reg, cfg.RequestRetry),
+		selector: pool.NewSelector(reg, cfg.RequestRetry, health),
+		health:   health,
 		affinity: affinity.New(cfg.ChannelAffinity),
 		auth:     access.New(cfg.APIKeys),
 		logger:   logger,
@@ -68,6 +76,7 @@ func New(cfg *config.Config, logger *reqlog.Logger) *Server {
 	mux.HandleFunc("DELETE /api/logs", s.handleLogsClear)
 	mux.HandleFunc("GET /api/logs/stats", s.handleLogsStats)
 	mux.HandleFunc("GET /api/affinity/stats", s.handleAffinityStats)
+	mux.HandleFunc("GET /api/routing/stats", s.handleRoutingStats)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("POST /v1/responses", s.handleResponses)
@@ -144,6 +153,11 @@ func (s *Server) Reload(cfg *config.Config) error {
 	}
 
 	nextReg := pool.BuildRegistry(&merged)
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.health.Reset()
+	s.health.ConfigureRouting(merged.Routing.Strategy, merged.Routing.HalfLifeDuration(), merged.Routing.Shadow)
+	s.affinity.Reset()
 	s.reg.ReplaceFrom(nextReg)
 	s.selector.SetRetry(merged.RequestRetry)
 	s.selector.ResetRoundRobin() // start fresh against rebuilt key pools
@@ -181,7 +195,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"name":"lite-cpa","endpoints":["GET /dashboard","GET /dashboard.html","GET /api/logs","DELETE /api/logs","GET /api/logs/stats","GET /v1/models","POST /v1/chat/completions","POST /v1/responses","POST /v1/messages","POST /v1/images/generations","POST /v1/images/edits"]}`))
+	_, _ = w.Write([]byte(`{"name":"lite-cpa","endpoints":["GET /dashboard","GET /dashboard.html","GET /api/logs","DELETE /api/logs","GET /api/logs/stats","GET /api/affinity/stats","GET /api/routing/stats","GET /v1/models","POST /v1/chat/completions","POST /v1/responses","POST /v1/messages","POST /v1/images/generations","POST /v1/images/edits"]}`))
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
@@ -273,6 +287,66 @@ func (s *Server) logReq(id string, r *http.Request, protocol, model, provider, u
 	s.logger.Record(rec)
 }
 
+func (s *Server) observeAttempt(reqID string, attempt int, model string, key registry.UpstreamKey, lease pool.Lease, status int, outcome pool.AttemptOutcome, startedAt, firstByteAt time.Time, retryAfter ...time.Duration) {
+	s.observeAttemptWithTokens(reqID, attempt, model, key, lease, status, outcome, startedAt, firstByteAt, 0, false, retryAfter...)
+}
+
+func (s *Server) observeAttemptWithTokens(reqID string, attempt int, model string, key registry.UpstreamKey, lease pool.Lease, status int, outcome pool.AttemptOutcome, startedAt, firstByteAt time.Time, outputTokens int64, outputKnown bool, retryAfter ...time.Duration) {
+	if s.selector == nil {
+		return
+	}
+	var firstChunkMS int64
+	if !firstByteAt.IsZero() {
+		firstChunkMS = firstByteAt.Sub(startedAt).Milliseconds()
+	}
+	var retryAfterDuration time.Duration
+	if len(retryAfter) > 0 {
+		retryAfterDuration = retryAfter[0]
+	}
+	actualModel := model
+	if key.Headers != nil && key.Headers["x-lite-upstream-model"] != "" {
+		actualModel = key.Headers["x-lite-upstream-model"]
+	}
+	s.selector.Finish(lease, pool.AttemptResult{
+		RequestID:         reqID,
+		Attempt:           attempt + 1,
+		Model:             model,
+		KeyID:             key.ID,
+		Provider:          key.Provider,
+		Upstream:          key.Name,
+		ActualModel:       actualModel,
+		Status:            status,
+		Outcome:           outcome,
+		DurationMS:        time.Since(startedAt).Milliseconds(),
+		FirstChunkMS:      firstChunkMS,
+		OutputTokens:      outputTokens,
+		FirstChunkKnown:   !firstByteAt.IsZero(),
+		OutputTokensKnown: outputKnown,
+		RetryAfter:        retryAfterDuration,
+		ProviderScoped:    key.FailoverMode == "provider" && (outcome == pool.OutcomeUpstream || outcome == pool.OutcomeTimeout),
+		StartedAt:         startedAt,
+	})
+}
+
+func classifyAttempt(err error, status int) pool.AttemptOutcome {
+	if err == nil {
+		return pool.OutcomeSuccess
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return pool.OutcomeAuth
+	}
+	if status == http.StatusTooManyRequests {
+		return pool.OutcomeRateLimited
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return pool.OutcomeTimeout
+	}
+	if status >= http.StatusInternalServerError || status == 0 {
+		return pool.OutcomeUpstream
+	}
+	return pool.OutcomeRequestError
+}
+
 func protocolOf(source translator.Format) string {
 	switch source {
 	case translator.FormatOpenAI:
@@ -350,6 +424,8 @@ func (s *Server) forward(
 	body []byte, start time.Time,
 	execute func(ctx context.Context, key registry.UpstreamKey, upstreamModel string) (any, error),
 ) {
+	s.stateMu.RLock()
+	requestGeneration := s.health.Generation()
 	aff := s.affinity.Lookup(resolveName, r.URL.Path, r.Header, body)
 	if aff.Found {
 		if s.debugEnabled() {
@@ -365,27 +441,58 @@ func (s *Server) forward(
 	// the request then falls back to normal selection with a full retry budget.
 	var preferredKey registry.UpstreamKey
 	preferredUsable := false
+	var preferredLease pool.Lease
 	if aff.Found {
 		if _, keys, ok := s.reg.Resolve(resolveName); ok {
 			if k, ok := affinity.ResolvePreferred(keys, aff.KeyID, tried); ok {
-				preferredKey = k
-				preferredUsable = true
+				if lease, admitted := s.selector.Acquire(resolveName, k); admitted {
+					preferredKey = k
+					preferredLease = lease
+					preferredUsable = true
+				}
 			}
 		}
 	}
+	maxAttempts := s.selector.MaxAttempts(resolveName)
+	s.stateMu.RUnlock()
 	if aff.Found && !preferredUsable {
 		s.affinity.MarkPreferredUnavailable()
 	}
-	maxAttempts := s.selector.MaxAttempts(resolveName)
+	recordAffinity := func(key registry.UpstreamKey) {
+		s.stateMu.RLock()
+		defer s.stateMu.RUnlock()
+		if requestGeneration != s.health.Generation() || !aff.Matched || aff.CacheKey == "" {
+			return
+		}
+		if s.currentCfg().ChannelAffinity.SwitchOnSuccessOrDefault() || !aff.Found || aff.KeyID == key.ID {
+			s.affinity.Record(aff.CacheKey, key.ID, aff.TTL)
+			if s.debugEnabled() {
+				log.Printf("affinity recorded rule=%s key=%s", aff.RuleName, key.ID)
+			}
+		}
+	}
+	clearAffinity := func(keyID string) {
+		s.stateMu.RLock()
+		defer s.stateMu.RUnlock()
+		if requestGeneration != s.health.Generation() || !aff.Matched || aff.CacheKey == "" || keyID != aff.KeyID {
+			return
+		}
+		s.affinity.Clear(aff.CacheKey)
+		if s.debugEnabled() {
+			log.Printf("affinity cleared rule=%s key=%s", aff.RuleName, keyID)
+		}
+	}
 	if preferredUsable && aff.SkipRetry {
 		maxAttempts = 1
 	}
 	var lastErr error
+	var availabilityErr *pool.AvailabilityError
 	lastErrLogged := false
 	var lastKey registry.UpstreamKey
 	for attempt := range maxAttempts {
 		var key registry.UpstreamKey
 		var upstreamModel string
+		lease := pool.Lease{}
 		var pickErr error
 
 		if attempt == 0 && preferredUsable {
@@ -399,15 +506,28 @@ func (s *Server) forward(
 			preferSupplier = preferredKey.Name
 		}
 		if key.ID == "" {
-			key, upstreamModel, pickErr = s.selector.Pick(resolveName, tried, preferSupplier, skipSuppliers)
+			s.stateMu.RLock()
+			if attempt == 0 && !preferredUsable {
+				key, upstreamModel, lease, pickErr = s.selector.PickWithLeaseExploring(resolveName, tried, preferSupplier, skipSuppliers)
+			} else {
+				key, upstreamModel, lease, pickErr = s.selector.PickWithLease(resolveName, tried, preferSupplier, skipSuppliers)
+			}
+			s.stateMu.RUnlock()
 			if pickErr != nil {
 				lastErr = pickErr
+				var ae *pool.AvailabilityError
+				if errors.As(pickErr, &ae) {
+					availabilityErr = ae
+				}
 				lastErrLogged = false
 				break
 			}
 			if preferSupplier == "" {
 				preferSupplier = key.Name
 			}
+		} else {
+			lease = preferredLease
+			preferredLease = pool.Lease{}
 		}
 		tried[key.ID] = struct{}{}
 		lastKey = key
@@ -418,22 +538,26 @@ func (s *Server) forward(
 		}
 
 		attemptStart := time.Now()
-		result, err := execute(r.Context(), key, upstreamModel)
+		attemptCtx, cancelAttempt := context.WithCancel(r.Context())
+		leasePtr := &lease
+		defer func(l *pool.Lease, cancel context.CancelFunc) {
+			cancel()
+			s.selector.Release(*l)
+		}(leasePtr, cancelAttempt)
+		result, err := execute(attemptCtx, key, upstreamModel)
 		if err != nil {
+			cancelAttempt()
 			if ctxErr := r.Context().Err(); ctxErr != nil {
+				s.observeAttempt(reqID, attempt, resolveName, key, lease, 0, pool.OutcomeCanceled, attemptStart, time.Time{})
 				s.logReq(reqID, r, protocol, model, key.Provider, key.Name, 0, reqlog.OutcomeClientCanceled, attemptStart, ctxErr.Error(), body, nil)
 				return
 			}
 			lastErr = err
 			lastErrLogged = false
-			if aff.Matched && aff.CacheKey != "" && key.ID == aff.KeyID {
-				s.affinity.Clear(aff.CacheKey)
-				if s.debugEnabled() {
-					log.Printf("affinity cleared rule=%s key=%s", aff.RuleName, key.ID)
-				}
-			}
 			if se, ok := err.(executor.StatusError); ok {
 				if se.Code == 401 || se.Code == 403 || se.Code == 429 || se.Code >= 500 {
+					clearAffinity(key.ID)
+					s.observeAttempt(reqID, attempt, resolveName, key, lease, se.Code, classifyAttempt(err, se.Code), attemptStart, time.Time{}, se.RetryAfter)
 					s.logReq(reqID, r, protocol, model, key.Provider, key.Name, se.Code, reqlog.OutcomeError, attemptStart, se.Error(), body, nil)
 					lastErrLogged = true
 					if s.debugEnabled() {
@@ -450,12 +574,15 @@ func (s *Server) forward(
 					}
 					continue
 				}
+				s.observeAttempt(reqID, attempt, resolveName, key, lease, se.Code, pool.OutcomeRequestError, attemptStart, time.Time{})
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(se.Code)
 				_, _ = w.Write([]byte(se.Body))
 				s.logReq(reqID, r, protocol, model, key.Provider, key.Name, se.Code, reqlog.OutcomeError, start, se.Error(), body, []byte(se.Body))
 				return
 			}
+			clearAffinity(key.ID)
+			s.observeAttempt(reqID, attempt, resolveName, key, lease, http.StatusBadGateway, classifyAttempt(err, 0), attemptStart, time.Time{})
 			s.logReq(reqID, r, protocol, model, key.Provider, key.Name, http.StatusBadGateway, reqlog.OutcomeError, attemptStart, err.Error(), body, nil)
 			lastErrLogged = true
 			if aff.Found && aff.SkipRetry && key.ID == aff.KeyID {
@@ -470,17 +597,10 @@ func (s *Server) forward(
 			continue
 		}
 		if ctxErr := r.Context().Err(); ctxErr != nil {
+			cancelAttempt()
+			s.observeAttempt(reqID, attempt, resolveName, key, lease, 0, pool.OutcomeCanceled, attemptStart, time.Time{})
 			s.logReq(reqID, r, protocol, model, key.Provider, key.Name, 0, reqlog.OutcomeClientCanceled, attemptStart, ctxErr.Error(), body, nil)
 			return
-		}
-
-		if aff.Matched {
-			if s.currentCfg().ChannelAffinity.SwitchOnSuccessOrDefault() || !aff.Found || aff.KeyID == key.ID {
-				s.affinity.Record(aff.CacheKey, key.ID, aff.TTL)
-				if s.debugEnabled() {
-					log.Printf("affinity recorded rule=%s key=%s", aff.RuleName, key.ID)
-				}
-			}
 		}
 
 		switch v := result.(type) {
@@ -498,11 +618,20 @@ func (s *Server) forward(
 				outcome = reqlog.OutcomeClientCanceled
 				errMsg = ctxErr.Error()
 			}
+			if outcome == reqlog.OutcomeCompleted {
+				s.observeAttemptWithTokens(reqID, attempt, resolveName, key, lease, v.Status, pool.OutcomeSuccess, attemptStart, time.Time{}, usage.outputTokens, usage.outputSeen)
+				recordAffinity(key)
+			} else {
+				s.observeAttempt(reqID, attempt, resolveName, key, lease, v.Status, pool.OutcomeCanceled, attemptStart, time.Time{})
+			}
+			cancelAttempt()
 			s.logReq(reqID, r, protocol, model, key.Provider, key.Name, http.StatusOK, outcome, start, errMsg, body, v.Body, usage)
 			return
 		case *executor.StreamResult:
 			flusher, ok := w.(http.Flusher)
 			if !ok {
+				cancelAttempt()
+				s.observeAttempt(reqID, attempt, resolveName, key, lease, http.StatusInternalServerError, pool.OutcomeRequestError, attemptStart, time.Time{})
 				writeAPIError(w, http.StatusInternalServerError, "server_error", "streaming not supported")
 				s.logReq(reqID, r, protocol, model, key.Provider, key.Name, http.StatusInternalServerError, reqlog.OutcomeError, start, "streaming not supported", body, nil)
 				return
@@ -514,45 +643,119 @@ func (s *Server) forward(
 			flusher.Flush()
 			var streamErr string
 			clientCanceled := false
+			streamAborted := false
+			var firstByteAt time.Time
 			var usage tokenUsage
-			for chunk := range v.Chunks {
-				if chunk.Err != nil {
-					if s.debugEnabled() {
-						log.Printf("stream error: %v", chunk.Err)
-					}
-					streamErr = chunk.Err.Error()
-					break
-				}
-				if chunk.LogError != "" && streamErr == "" {
-					streamErr = chunk.LogError
-				}
-				if len(chunk.Payload) == 0 {
-					continue
-				}
-				usage.mergePayload(chunk.Payload)
-				if _, err := w.Write(chunk.Payload); err != nil {
-					streamErr = err.Error()
+			streamDone := false
+			for !streamDone {
+				select {
+				case <-r.Context().Done():
 					clientCanceled = true
-					break
+					streamAborted = true
+					streamErr = r.Context().Err().Error()
+					cancelAttempt()
+					streamDone = true
+				case chunk, ok := <-v.Chunks:
+					if !ok {
+						streamDone = true
+						continue
+					}
+					if chunk.Err != nil {
+						streamAborted = true
+						cancelAttempt()
+						if s.debugEnabled() {
+							log.Printf("stream error: %v", chunk.Err)
+						}
+						streamErr = chunk.Err.Error()
+						streamDone = true
+						continue
+					}
+					if chunk.LogError != "" && streamErr == "" {
+						streamErr = chunk.LogError
+					}
+					if len(chunk.Payload) == 0 {
+						continue
+					}
+					if firstByteAt.IsZero() {
+						firstByteAt = time.Now()
+					}
+					usage.mergePayload(chunk.Payload)
+					if _, err := w.Write(chunk.Payload); err != nil {
+						streamErr = err.Error()
+						clientCanceled = true
+						streamAborted = true
+						cancelAttempt()
+						streamDone = true
+						continue
+					}
+					flusher.Flush()
 				}
-				flusher.Flush()
 			}
 			if ctxErr := r.Context().Err(); ctxErr != nil {
 				clientCanceled = true
 				streamErr = ctxErr.Error()
 			}
+			completion := executor.StreamFailed
+			if !streamAborted && !clientCanceled {
+				if v.Complete != nil {
+					select {
+					case completion = <-v.Complete:
+					case <-r.Context().Done():
+						clientCanceled = true
+						streamAborted = true
+						streamErr = r.Context().Err().Error()
+					}
+				} else {
+					streamErr = "upstream stream ended without a completion status"
+				}
+				if completion == executor.StreamIncomplete && streamErr == "" {
+					streamErr = "upstream stream ended with an incomplete response"
+				}
+				if completion != executor.StreamCompleted && completion != executor.StreamIncomplete && streamErr == "" {
+					streamErr = "upstream stream ended before completion"
+				}
+			}
+			cancelAttempt()
 			outcome := reqlog.OutcomeCompleted
 			if clientCanceled {
 				outcome = reqlog.OutcomeClientCanceled
 			} else if streamErr != "" {
 				outcome = reqlog.OutcomeError
 			}
+			if outcome == reqlog.OutcomeCompleted && completion == executor.StreamCompleted {
+				s.observeAttemptWithTokens(reqID, attempt, resolveName, key, lease, v.Status, pool.OutcomeSuccess, attemptStart, firstByteAt, usage.outputTokens, usage.outputSeen)
+				recordAffinity(key)
+			} else if clientCanceled {
+				s.observeAttemptWithTokens(reqID, attempt, resolveName, key, lease, v.Status, pool.OutcomeCanceled, attemptStart, firstByteAt, usage.outputTokens, usage.outputSeen)
+			} else {
+				attemptOutcome := pool.OutcomeUpstream
+				if completion == executor.StreamIncomplete {
+					attemptOutcome = pool.OutcomeRequestError
+				}
+				if !clientCanceled {
+					clearAffinity(key.ID)
+				}
+				s.observeAttemptWithTokens(reqID, attempt, resolveName, key, lease, v.Status, attemptOutcome, attemptStart, firstByteAt, usage.outputTokens, usage.outputSeen)
+			}
 			s.logReq(reqID, r, protocol, model, key.Provider, key.Name, http.StatusOK, outcome, start, streamErr, body, nil, usage)
 			return
 		default:
+			cancelAttempt()
+			s.observeAttempt(reqID, attempt, resolveName, key, lease, http.StatusBadGateway, pool.OutcomeUpstream, attemptStart, time.Time{})
 			lastErr = fmt.Errorf("unexpected executor result type %T", result)
 			lastErrLogged = false
 		}
+	}
+	if availabilityErr != nil {
+		seconds := int64(math.Ceil(time.Until(availabilityErr.RetryAt).Seconds()))
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+		msg := fmt.Sprintf("all upstream credentials are cooling down for model %s", availabilityErr.Model)
+		writeAPIError(w, http.StatusTooManyRequests, "rate_limit_error", msg)
+		s.logReq(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, http.StatusTooManyRequests, reqlog.OutcomeError, start, msg, body, nil)
+		return
 	}
 
 	if lastErr != nil {

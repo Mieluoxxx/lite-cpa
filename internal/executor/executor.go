@@ -23,6 +23,15 @@ import (
 
 const streamScanMax = 1 << 20 // 1MiB
 
+type streamProtocol string
+
+const (
+	streamProtocolChat      streamProtocol = "chat"
+	streamProtocolResponses streamProtocol = "responses"
+	streamProtocolClaude    streamProtocol = "claude"
+	streamProtocolImages    streamProtocol = "images"
+)
+
 const anthropicFastModeBeta = "fast-mode-2026-02-01"
 
 type Result struct {
@@ -31,10 +40,20 @@ type Result struct {
 	Body    []byte
 }
 
+type StreamCompletion string
+
+const (
+	StreamCompleted  StreamCompletion = "completed"
+	StreamIncomplete StreamCompletion = "incomplete"
+	StreamFailed     StreamCompletion = "failed"
+	StreamCanceled   StreamCompletion = "canceled"
+)
+
 type StreamResult struct {
-	Status  int
-	Headers http.Header
-	Chunks  <-chan StreamChunk
+	Status   int
+	Headers  http.Header
+	Chunks   <-chan StreamChunk
+	Complete <-chan StreamCompletion
 }
 
 type StreamChunk struct {
@@ -44,8 +63,9 @@ type StreamChunk struct {
 }
 
 type StatusError struct {
-	Code int
-	Body string
+	Code       int
+	Body       string
+	RetryAfter time.Duration
 }
 
 func (e StatusError) Error() string {
@@ -56,6 +76,30 @@ func (e StatusError) Error() string {
 }
 
 func (e StatusError) StatusCode() int { return e.Code }
+
+func newStatusError(resp *http.Response, body []byte) StatusError {
+	return StatusError{
+		Code:       resp.StatusCode,
+		Body:       string(body),
+		RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+	}
+}
+
+func parseRetryAfter(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := time.ParseDuration(value + "s"); err == nil && seconds > 0 {
+		return seconds
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		if delay := time.Until(when); delay > 0 {
+			return delay
+		}
+	}
+	return 0
+}
 
 // Execute routes to the correct standard upstream protocol.
 // Providers: openai | openai-response | claude (no Codex).
@@ -196,7 +240,7 @@ func executeOpenAI(ctx context.Context, key registry.UpstreamKey, from, to trans
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, StatusError{Code: resp.StatusCode, Body: string(data)}
+		return nil, newStatusError(resp, data)
 	}
 	var param any
 	out := translator.TranslateNonStream(ctx, to, from, model, original, body, data, &param)
@@ -214,13 +258,13 @@ func executeOpenAIStream(ctx context.Context, key registry.UpstreamKey, from, to
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return nil, StatusError{Code: resp.StatusCode, Body: string(data)}
+		return nil, newStatusError(resp, data)
 	}
 	// Same-format: forward upstream SSE verbatim so [DONE] and framing stay intact.
 	if from == to {
-		return streamPassthrough(ctx, resp)
+		return streamPassthrough(ctx, resp, streamProtocolChat)
 	}
-	return streamSSE(ctx, resp, from, to, model, original, body), nil
+	return streamSSE(ctx, resp, from, to, model, original, body, streamProtocolChat), nil
 }
 
 func executeResponses(ctx context.Context, key registry.UpstreamKey, from, to translator.Format, model string, original, body []byte) (*Result, error) {
@@ -237,7 +281,7 @@ func executeResponses(ctx context.Context, key registry.UpstreamKey, from, to tr
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, StatusError{Code: resp.StatusCode, Body: string(data)}
+		return nil, newStatusError(resp, data)
 	}
 	var param any
 	out := translator.TranslateNonStream(ctx, to, from, model, original, body, data, &param)
@@ -254,13 +298,13 @@ func executeResponsesStream(ctx context.Context, key registry.UpstreamKey, from,
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return nil, StatusError{Code: resp.StatusCode, Body: string(data)}
+		return nil, newStatusError(resp, data)
 	}
 	// Same-format: preserve event:/data: association (do not reframe each line).
 	if from == to {
-		return streamPassthrough(ctx, resp)
+		return streamPassthrough(ctx, resp, streamProtocolResponses)
 	}
-	return streamSSE(ctx, resp, from, to, model, original, body), nil
+	return streamSSE(ctx, resp, from, to, model, original, body, streamProtocolResponses), nil
 }
 
 func executeClaude(ctx context.Context, key registry.UpstreamKey, from, to translator.Format, model string, original, body []byte) (*Result, error) {
@@ -285,7 +329,10 @@ func executeClaude(ctx context.Context, key registry.UpstreamKey, from, to trans
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, StatusError{Code: resp.StatusCode, Body: string(data)}
+		return nil, newStatusError(resp, data)
+	}
+	if useUpstreamStream && streamCompletionFromBody(data, streamProtocolClaude) != StreamCompleted {
+		return nil, errors.New("upstream Claude stream ended without a successful terminal event")
 	}
 	var param any
 	out := translator.TranslateNonStream(ctx, to, from, model, original, body, data, &param)
@@ -306,12 +353,12 @@ func executeClaudeStream(ctx context.Context, key registry.UpstreamKey, from, to
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return nil, StatusError{Code: resp.StatusCode, Body: string(data)}
+		return nil, newStatusError(resp, data)
 	}
 	if from == to {
-		return streamPassthrough(ctx, resp)
+		return streamPassthrough(ctx, resp, streamProtocolClaude)
 	}
-	return streamSSE(ctx, resp, from, to, model, original, body), nil
+	return streamSSE(ctx, resp, from, to, model, original, body, streamProtocolClaude), nil
 }
 
 // ExecuteImage forwards an OpenAI Images API request verbatim to an upstream
@@ -330,9 +377,9 @@ func ExecuteImage(ctx context.Context, key registry.UpstreamKey, payload []byte,
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			data, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			return nil, StatusError{Code: resp.StatusCode, Body: string(data)}
+			return nil, newStatusError(resp, data)
 		}
-		return streamPassthrough(ctx, resp)
+		return streamPassthrough(ctx, resp, streamProtocolImages)
 	}
 	resp, err := doRaw(ctx, key, url, payload, contentType, false)
 	if err != nil {
@@ -344,7 +391,7 @@ func ExecuteImage(ctx context.Context, key registry.UpstreamKey, payload []byte,
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, StatusError{Code: resp.StatusCode, Body: string(data)}
+		return nil, newStatusError(resp, data)
 	}
 	return &Result{Status: resp.StatusCode, Headers: resp.Header.Clone(), Body: data}, nil
 }
@@ -419,69 +466,91 @@ func applyCustomHeaders(req *http.Request, headers map[string]string) {
 	}
 }
 
-func streamSSE(ctx context.Context, resp *http.Response, from, to translator.Format, model string, original, translated []byte) *StreamResult {
+func streamSSE(ctx context.Context, resp *http.Response, from, to translator.Format, model string, original, translated []byte, protocol streamProtocol) *StreamResult {
 	out := make(chan StreamChunk, 16)
+	complete := make(chan StreamCompletion, 1)
 	go func() {
+		status := StreamFailed
 		defer close(out)
+		defer func() {
+			complete <- status
+			close(complete)
+		}()
 		defer resp.Body.Close()
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 0, 64*1024), streamScanMax)
 		var param any
+		terminal := StreamCompletion("")
 		sawOpenAIDONE := false
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			trimmed := bytes.TrimSpace(line)
-			if len(trimmed) == 0 {
-				continue
+		emit := func(payload []byte) bool {
+			select {
+			case out <- StreamChunk{Payload: payload}:
+				return true
+			case <-ctx.Done():
+				status = StreamCanceled
+				return false
 			}
-			chunks := translator.TranslateStream(ctx, to, from, model, original, translated, bytes.Clone(trimmed), &param)
-			for _, c := range chunks {
-				if len(c) == 0 {
-					continue
-				}
-				if from == translator.FormatOpenAI && isOpenAIDONE(c) {
-					sawOpenAIDONE = true
-				}
-				framed := frameForClient(c, from)
+		}
+		for {
+			event, done, eventComplete, scanErr := readSSEEvent(scanner)
+			if scanErr != nil {
 				select {
-				case out <- StreamChunk{Payload: framed}:
+				case out <- StreamChunk{Err: scanErr}:
 				case <-ctx.Done():
+					status = StreamCanceled
+				}
+				return
+			}
+			if len(event) > 0 && eventComplete {
+				if next := streamTerminalStatus(protocol, event...); next != "" {
+					if next == StreamFailed {
+						select {
+						case out <- StreamChunk{Err: errors.New("upstream stream reported failure")}:
+							status = StreamFailed
+						case <-ctx.Done():
+							status = StreamCanceled
+						}
+						return
+					}
+					terminal = mergeTerminalStatus(terminal, next)
+				}
+				for _, line := range event {
+					trimmed := bytes.TrimSpace(line)
+					if len(trimmed) == 0 {
+						continue
+					}
+					chunks := translator.TranslateStream(ctx, to, from, model, original, translated, bytes.Clone(trimmed), &param)
+					for _, chunk := range chunks {
+						if len(chunk) == 0 {
+							continue
+						}
+						if from == translator.FormatOpenAI && isOpenAIDONE(chunk) {
+							sawOpenAIDONE = true
+						}
+						if !emit(frameForClient(chunk, from)) {
+							return
+						}
+					}
+				}
+				if terminal == StreamFailed {
+					status = StreamFailed
 					return
 				}
 			}
-		}
-		if err := scanner.Err(); err != nil {
-			select {
-			case out <- StreamChunk{Err: err}:
-			case <-ctx.Done():
-			}
-			return
-		}
-		// Flush translators that emit terminal events on [DONE].
-		chunks := translator.TranslateStream(ctx, to, from, model, original, translated, []byte("data: [DONE]"), &param)
-		for _, c := range chunks {
-			if len(c) == 0 {
-				continue
-			}
-			if from == translator.FormatOpenAI && isOpenAIDONE(c) {
-				sawOpenAIDONE = true
-			}
-			framed := frameForClient(c, from)
-			select {
-			case out <- StreamChunk{Payload: framed}:
-			case <-ctx.Done():
-				return
+			if done {
+				break
 			}
 		}
-		// OpenAI chat clients expect a single terminal data: [DONE] event.
-		if from == translator.FormatOpenAI && !sawOpenAIDONE {
-			select {
-			case out <- StreamChunk{Payload: []byte("data: [DONE]\n\n")}:
-			case <-ctx.Done():
+		if terminal == StreamCompleted || terminal == StreamIncomplete {
+			if from == translator.FormatOpenAI && !sawOpenAIDONE {
+				if !emit([]byte("data: [DONE]\n\n")) {
+					return
+				}
 			}
+			status = terminal
 		}
 	}()
-	return &StreamResult{Status: resp.StatusCode, Headers: resp.Header.Clone(), Chunks: out}
+	return &StreamResult{Status: resp.StatusCode, Headers: resp.Header.Clone(), Chunks: out, Complete: complete}
 }
 
 func isOpenAIDONE(chunk []byte) bool {
@@ -490,6 +559,101 @@ func isOpenAIDONE(chunk []byte) bool {
 		trimmed = bytes.TrimSpace(trimmed[5:])
 	}
 	return bytes.Equal(trimmed, []byte("[DONE]"))
+}
+
+// streamEventStatus recognizes terminal events before the response body is
+// handed back to the server. Clean channel closure alone is not enough: a
+// truncated SSE stream can also close without an error.
+func streamEventStatus(lines ...[]byte) (terminal, success bool) {
+	status := streamTerminalStatus(inferStreamProtocol(lines...), lines...)
+	return status != "", status == StreamCompleted
+}
+
+func streamTerminalStatus(protocol streamProtocol, lines ...[]byte) StreamCompletion {
+	eventName := ""
+	dataParts := make([]string, 0, 1)
+	for _, line := range lines {
+		trimmed := bytes.TrimSpace(line)
+		switch {
+		case bytes.HasPrefix(trimmed, []byte("event:")):
+			eventName = strings.TrimSpace(string(trimmed[len("event:"):]))
+		case bytes.HasPrefix(trimmed, []byte("data:")):
+			dataParts = append(dataParts, strings.TrimSpace(string(trimmed[len("data:"):])))
+		}
+	}
+	data := strings.TrimSpace(strings.Join(dataParts, "\n"))
+	if protocol == streamProtocolChat {
+		if data == "[DONE]" {
+			return StreamCompleted
+		}
+		errorValue := gjson.Get(data, "error")
+		if eventName == "error" || (data != "" && gjson.Valid(data) && (gjson.Get(data, "type").String() == "error" || (errorValue.Exists() && errorValue.Type != gjson.Null))) {
+			return StreamFailed
+		}
+		return ""
+	}
+	if data == "" || !gjson.Valid(data) {
+		return ""
+	}
+	eventType := gjson.Get(data, "type").String()
+	if errorValue := gjson.Get(data, "error"); errorValue.Exists() && errorValue.Type != gjson.Null {
+		return StreamFailed
+	}
+	if protocol == streamProtocolImages {
+		switch eventType {
+		case "image_generation.completed":
+			return StreamCompleted
+		case "image_generation.failed", "error":
+			return StreamFailed
+		default:
+			return ""
+		}
+	}
+	if protocol == streamProtocolClaude {
+		if eventType == "message_stop" && gjson.Parse(data).IsObject() {
+			return StreamCompleted
+		}
+		if eventName == "error" || eventType == "error" || eventType == "message_error" {
+			return StreamFailed
+		}
+		return ""
+	}
+	if eventType == "response.completed" {
+		return StreamCompleted
+	}
+	if eventType == "response.incomplete" {
+		return StreamIncomplete
+	}
+	if eventType == "response.failed" || eventName == "error" || eventType == "error" || eventName == "response.error" || eventType == "response.error" {
+		return StreamFailed
+	}
+	return ""
+}
+
+func mergeTerminalStatus(current, next StreamCompletion) StreamCompletion {
+	if next == StreamFailed {
+		return StreamFailed
+	}
+	if current == StreamFailed {
+		return current
+	}
+	if current == "" {
+		return next
+	}
+	return current
+}
+
+func inferStreamProtocol(lines ...[]byte) streamProtocol {
+	for _, line := range lines {
+		trimmed := bytes.TrimSpace(line)
+		if bytes.Contains(trimmed, []byte("response.")) {
+			return streamProtocolResponses
+		}
+		if bytes.Contains(trimmed, []byte("message_stop")) {
+			return streamProtocolClaude
+		}
+	}
+	return streamProtocolChat
 }
 
 // frameForClient formats a translator chunk for the client protocol.
@@ -562,8 +726,14 @@ func guardResponsesClientStream(ctx context.Context, source translator.Format, m
 
 func ensureResponsesTerminal(ctx context.Context, result *StreamResult, model string) *StreamResult {
 	out := make(chan StreamChunk, 16)
+	complete := make(chan StreamCompletion, 1)
 	go func() {
+		completed := StreamFailed
 		defer close(out)
+		defer func() {
+			complete <- completed
+			close(complete)
+		}()
 		observer := responsesTerminalObserver{model: model}
 
 		send := func(chunk StreamChunk) bool {
@@ -576,11 +746,23 @@ func ensureResponsesTerminal(ctx context.Context, result *StreamResult, model st
 			case out <- chunk:
 				return true
 			case <-ctx.Done():
+				completed = StreamCanceled
 				return false
 			}
 		}
 
-		for chunk := range result.Chunks {
+		for {
+			var chunk StreamChunk
+			var ok bool
+			select {
+			case <-ctx.Done():
+				completed = StreamCanceled
+				return
+			case chunk, ok = <-result.Chunks:
+				if !ok {
+					goto drained
+				}
+			}
 			if len(chunk.Payload) > 0 {
 				observer.observe(chunk.Payload)
 			}
@@ -597,21 +779,54 @@ func ensureResponsesTerminal(ctx context.Context, result *StreamResult, model st
 				}
 			}
 			observer.finish()
-			if observer.needsFailure() && ctx.Err() == nil && !errors.Is(chunk.Err, context.Canceled) {
+			if observer.needsFailure() && ctx.Err() == nil {
 				send(StreamChunk{Payload: observer.failureEvent(), LogError: chunk.Err.Error()})
 				return
+			}
+			if ctx.Err() != nil {
+				completed = StreamCanceled
+			} else {
+				completed = StreamFailed
 			}
 			send(StreamChunk{Err: chunk.Err})
 			return
 		}
+	drained:
 
 		observer.finish()
 		if observer.needsFailure() && ctx.Err() == nil {
 			send(StreamChunk{Payload: observer.failureEvent(), LogError: responsesMissingTerminalError})
+			return
 		}
+		upstreamCompleted := StreamFailed
+		if result.Complete != nil {
+			select {
+			case upstreamCompleted = <-result.Complete:
+			case <-ctx.Done():
+				completed = StreamCanceled
+				return
+			}
+		}
+		completed = mergeCompletionStatus(observer.completion(), upstreamCompleted)
 	}()
 
-	return &StreamResult{Status: result.Status, Headers: result.Headers, Chunks: out}
+	return &StreamResult{Status: result.Status, Headers: result.Headers, Chunks: out, Complete: complete}
+}
+
+func mergeCompletionStatus(left, right StreamCompletion) StreamCompletion {
+	if left == StreamCanceled || right == StreamCanceled {
+		return StreamCanceled
+	}
+	if left == StreamFailed || right == StreamFailed {
+		return StreamFailed
+	}
+	if left == StreamIncomplete || right == StreamIncomplete {
+		return StreamIncomplete
+	}
+	if left == StreamCompleted && right == StreamCompleted {
+		return StreamCompleted
+	}
+	return StreamFailed
 }
 
 type responsesTerminalObserver struct {
@@ -622,6 +837,8 @@ type responsesTerminalObserver struct {
 	hasSequence   bool
 	terminalSeen  bool
 	explicitError bool
+	failed        bool
+	incomplete    bool
 	parseDisabled bool
 }
 
@@ -647,9 +864,9 @@ func (o *responsesTerminalObserver) observe(chunk []byte) {
 }
 
 func (o *responsesTerminalObserver) finish() {
-	if len(bytes.TrimSpace(o.pending)) > 0 && !o.parseDisabled {
-		o.observeEvent(o.pending)
-	}
+	// An SSE frame without a blank-line delimiter is truncated, even if its
+	// payload happens to contain a terminal event name. Never promote it to a
+	// successful completion.
 	o.pending = nil
 }
 
@@ -691,12 +908,35 @@ func (o *responsesTerminalObserver) observeEvent(frame []byte) {
 	switch eventType {
 	case "response.completed", "response.incomplete", "response.failed":
 		o.terminalSeen = true
+		o.incomplete = eventType == "response.incomplete"
+		if eventType == "response.failed" {
+			o.failed = true
+		}
 	case "error", "response.error":
 		o.explicitError = true
+		o.failed = true
 	}
 	if eventName == "error" || eventName == "response.error" {
 		o.explicitError = true
+		o.failed = true
 	}
+}
+
+func (o *responsesTerminalObserver) successful() bool {
+	return o.terminalSeen && !o.failed
+}
+
+func (o *responsesTerminalObserver) completion() StreamCompletion {
+	if o.successful() {
+		if o.incomplete {
+			return StreamIncomplete
+		}
+		return StreamCompleted
+	}
+	if o.terminalSeen || o.explicitError {
+		return StreamFailed
+	}
+	return StreamIncomplete
 }
 
 func (o *responsesTerminalObserver) needsFailure() bool {
@@ -745,10 +985,10 @@ func (o *responsesTerminalObserver) failureEvent() []byte {
 	return framed
 }
 
-func streamPassthrough(ctx context.Context, resp *http.Response) (*StreamResult, error) {
+func streamPassthrough(ctx context.Context, resp *http.Response, protocol streamProtocol) (*StreamResult, error) {
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), streamScanMax)
-	first, done, err := readSSEEvent(scanner)
+	first, done, firstComplete, err := readSSEEvent(scanner)
 	if err != nil {
 		resp.Body.Close()
 		return nil, err
@@ -759,8 +999,19 @@ func streamPassthrough(ctx context.Context, resp *http.Response) (*StreamResult,
 	}
 
 	out := make(chan StreamChunk, 16)
+	complete := make(chan StreamCompletion, 1)
 	go func() {
+		completed := StreamCompletion("")
+		if firstComplete {
+			if status := streamTerminalStatus(protocol, first...); status != "" {
+				completed = status
+			}
+		}
 		defer close(out)
+		defer func() {
+			complete <- completed
+			close(complete)
+		}()
 		defer resp.Body.Close()
 		emit := func(event [][]byte) bool {
 			logError := semanticSSEError(event)
@@ -772,46 +1023,95 @@ func streamPassthrough(ctx context.Context, resp *http.Response) (*StreamResult,
 				select {
 				case out <- chunk:
 				case <-ctx.Done():
+					completed = StreamCanceled
 					return false
 				}
 			}
 			return true
 		}
 
+		if !firstComplete && done {
+			completed = StreamFailed
+			return
+		}
 		if !emit(first) {
 			return
 		}
+		if completed == StreamFailed {
+			return
+		}
 		for !done {
-			event, eventDone, scanErr := readSSEEvent(scanner)
-			if !emit(event) {
-				return
-			}
+			event, eventDone, eventComplete, scanErr := readSSEEvent(scanner)
 			if scanErr != nil {
+				completed = StreamFailed
 				select {
 				case out <- StreamChunk{Err: scanErr}:
 				case <-ctx.Done():
+					completed = StreamCanceled
 				}
+				return
+			}
+			if len(event) == 0 && eventDone {
+				done = true
+				break
+			}
+			if !eventComplete {
+				completed = StreamFailed
+				return
+			}
+			if status := streamTerminalStatus(protocol, event...); status != "" {
+				completed = mergeTerminalStatus(completed, status)
+			}
+			if !emit(event) {
+				return
+			}
+			if completed == StreamFailed {
 				return
 			}
 			done = eventDone
 		}
+		if completed == "" {
+			completed = StreamFailed
+		}
 	}()
-	return &StreamResult{Status: resp.StatusCode, Headers: resp.Header.Clone(), Chunks: out}, nil
+	return &StreamResult{Status: resp.StatusCode, Headers: resp.Header.Clone(), Chunks: out, Complete: complete}, nil
 }
 
 // readSSEEvent reads one complete SSE event while retaining each source line.
-func readSSEEvent(scanner *bufio.Scanner) (event [][]byte, done bool, err error) {
+func readSSEEvent(scanner *bufio.Scanner) (event [][]byte, done, complete bool, err error) {
 	for scanner.Scan() {
 		line := bytes.Clone(scanner.Bytes())
 		event = append(event, line)
 		if len(bytes.TrimSpace(line)) == 0 {
-			return event, false, nil
+			return event, false, true, nil
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return event, true, err
+		return event, true, false, err
 	}
-	return event, true, nil
+	return event, true, false, nil
+}
+
+func streamCompletionFromBody(body []byte, protocol streamProtocol) StreamCompletion {
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	scanner.Buffer(make([]byte, 0, 64*1024), streamScanMax)
+	completion := StreamCompletion("")
+	for {
+		event, done, eventComplete, err := readSSEEvent(scanner)
+		if err != nil {
+			return StreamFailed
+		}
+		if eventComplete {
+			completion = mergeTerminalStatus(completion, streamTerminalStatus(protocol, event...))
+		}
+		if done {
+			break
+		}
+	}
+	if completion == "" {
+		return StreamFailed
+	}
+	return completion
 }
 
 // semanticSSEError extracts an upstream error that arrived in an otherwise
@@ -832,7 +1132,7 @@ func semanticSSEError(event [][]byte) string {
 	if eventName != "error" && eventName != "response.failed" {
 		parsed := gjson.Parse(data)
 		kind := parsed.Get("type").String()
-		if kind != "error" && kind != "response.failed" && parsed.Get("response.status").String() != "failed" {
+		if kind != "error" && kind != "response.failed" && parsed.Get("error").Type == gjson.Null && parsed.Get("response.status").String() != "failed" {
 			return ""
 		}
 	}

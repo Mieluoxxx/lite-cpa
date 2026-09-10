@@ -64,6 +64,7 @@ Copy `config/config.example.yaml` → `config/config.yaml`. **At least one** of 
 | `max-body-bytes` | `32MiB` | Inbound body limit |
 | `proxy-url` | empty | Global outbound proxy fallback if provider has none |
 | `channel-affinity` | on by default | See [Channel affinity](#channel-affinity) |
+| `routing` | `priority` | Optional same-priority reliability-aware selection; see [Adaptive routing](#adaptive-routing) |
 | `request-log` | disabled | See [Request log](#request-log) |
 
 ### Provider sections
@@ -168,6 +169,12 @@ channel-affinity:
 **Model family match:** substring, case-insensitive (e.g. `proxy-claude-x` matches `claude`).
 
 Advanced: set `rules:` to fully override generated family rules (see `internal/config` types). Empty `rules` with enabled affinity expands from `models` / defaults.
+
+### Adaptive routing
+
+`routing.strategy` defaults to `priority`, preserving provider priority, key entry priority, and round-robin behavior. Set `adaptive` to rank candidates only within the same provider/entry priority tier using decay-weighted Beta reliability; affinity and cooldown gates still run first. `half-life` defaults to `72h`. `shadow: true` collects reliability observations and an adaptive recommendation in `/api/routing/stats` without changing selection.
+
+Adaptive routing is intentionally reliability-only in this phase. It does not infer quotas, rewrite configuration priorities, or use randomized Thompson sampling. Unknown keys use the neutral Beta prior and retain deterministic round-robin order, providing bounded cold-start exploration.
 
 ### Request log
 

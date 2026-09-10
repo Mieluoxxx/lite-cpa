@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -72,6 +73,40 @@ func TestChannelAffinityYAMLForms(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRoutingConfigDefaultsAndAdaptive(t *testing.T) {
+	var cfg Config
+	raw := `
+port: 1
+api-keys: [k]
+routing:
+  strategy: adaptive
+  half-life: 24h
+  shadow: true
+openai-completions:
+  - name: x
+    base-url: http://x
+    api-key: a
+    models: [{name: m}]
+`
+	if err := yaml.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults()
+	if err := cfg.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Routing.Strategy != "adaptive" || cfg.Routing.HalfLifeDuration() != 24*time.Hour || !cfg.Routing.Shadow {
+		t.Fatalf("routing=%+v", cfg.Routing)
+	}
+}
+
+func TestRoutingConfigRejectsUnknownStrategy(t *testing.T) {
+	cfg := Config{Port: 1, APIKeys: []string{"k"}, Routing: RoutingConfig{Strategy: "random", HalfLife: "72h"}, OpenAICompletions: []Provider{{Name: "x", BaseURL: "http://x", APIKey: "a", Models: []ModelAlias{{Name: "m"}}}}}
+	if err := cfg.validate(); err == nil {
+		t.Fatal("unknown routing strategy should fail validation")
 	}
 }
 

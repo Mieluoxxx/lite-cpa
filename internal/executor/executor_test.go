@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mieluoxxx/lite-cpa/internal/registry"
 	"github.com/Mieluoxxx/lite-cpa/internal/translator"
@@ -276,7 +277,7 @@ func TestExecuteResponsesInjectsModelVerbosity(t *testing.T) {
 			gotBody, _ = io.ReadAll(r.Body)
 			if stream {
 				w.Header().Set("Content-Type", "text/event-stream")
-				_, _ = w.Write([]byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n"))
+				_, _ = w.Write([]byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"))
 			} else {
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","model":"gpt-5.6-luna","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}]}`))
@@ -438,6 +439,146 @@ func TestEnsureResponsesTerminalSkipsFailureAfterCancellation(t *testing.T) {
 	}
 }
 
+func TestEnsureResponsesTerminalReportsCompletionStatus(t *testing.T) {
+	chunks := make(chan StreamChunk, 1)
+	chunks <- StreamChunk{Payload: []byte("event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n")}
+	close(chunks)
+
+	guarded := ensureResponsesTerminal(context.Background(), &StreamResult{Status: http.StatusOK, Chunks: chunks, Complete: completedStream(StreamCompleted)}, "gpt-5")
+	collectStream(t, guarded)
+	if got := <-guarded.Complete; got != StreamCompleted {
+		t.Fatalf("completion=%q, want %q", got, StreamCompleted)
+	}
+}
+
+func completedStream(status StreamCompletion) <-chan StreamCompletion {
+	ch := make(chan StreamCompletion, 1)
+	ch <- status
+	close(ch)
+	return ch
+}
+
+func TestStreamPassthroughCompletionByProtocol(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol streamProtocol
+		body     string
+		want     StreamCompletion
+	}{
+		{"chat", streamProtocolChat, "data: {\"x\":1}\n\ndata: [DONE]\n\n", StreamCompleted},
+		{"responses", streamProtocolResponses, "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n", StreamCompleted},
+		{"claude", streamProtocolClaude, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", StreamCompleted},
+		{"images", streamProtocolImages, "event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\"}\n\n", StreamCompleted},
+		{"truncated", streamProtocolChat, "data: [DONE]", StreamFailed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := streamPassthrough(context.Background(), &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(tt.body)),
+			}, tt.protocol)
+			if err != nil {
+				t.Fatal(err)
+			}
+			collectStream(t, result)
+			if got := <-result.Complete; got != tt.want {
+				t.Fatalf("completion=%q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStreamErrorCannotBeFollowedBySuccessfulDone(t *testing.T) {
+	translator.RegisterBuiltin()
+	tests := []struct {
+		name     string
+		from     translator.Format
+		to       translator.Format
+		protocol streamProtocol
+		body     string
+	}{
+		{"chat", translator.FormatOpenAIResponse, translator.FormatOpenAI, streamProtocolChat, "data: {\"error\":{\"message\":\"busy\"}}\n\ndata: [DONE]\n\n"},
+		{"responses", translator.FormatOpenAI, translator.FormatOpenAIResponse, streamProtocolResponses, "event: response.failed\ndata: {\"type\":\"response.failed\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"},
+		{"claude", translator.FormatOpenAI, translator.FormatClaude, streamProtocolClaude, "event: error\ndata: {\"type\":\"error\"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := streamSSE(context.Background(), &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(tt.body)),
+			}, tt.from, tt.to, "m", nil, nil, tt.protocol)
+			collectStream(t, result)
+			if got := <-result.Complete; got == StreamCompleted {
+				t.Fatalf("error stream reported successful completion")
+			}
+		})
+	}
+}
+
+func TestExecuteErrorCannotBeFollowedBySuccessfulDone(t *testing.T) {
+	translator.RegisterBuiltin()
+	tests := []struct {
+		name   string
+		source translator.Format
+	}{
+		{"chat", translator.FormatOpenAI},
+		{"responses", translator.FormatOpenAIResponse},
+		{"claude", translator.FormatClaude},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstreamBody := "data: {\"error\":{\"message\":\"busy\"}}\n\ndata: [DONE]\n\n"
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(upstreamBody))
+			}))
+			defer up.Close()
+			key := registry.UpstreamKey{Provider: "openai", BaseURL: up.URL, APIKey: "sk-test"}
+			result, err := Execute(context.Background(), key, "m", tt.source, []byte(`{"model":"m"}`), true)
+			if err != nil {
+				statusErr, ok := err.(StatusError)
+				if !ok || statusErr.Code != http.StatusServiceUnavailable {
+					t.Fatalf("unexpected pre-stream error: %T %#v", err, err)
+				}
+				return
+			}
+			stream, ok := result.(*StreamResult)
+			if !ok {
+				t.Fatalf("result type=%T, want *StreamResult", result)
+			}
+			body, _, _ := collectStream(t, stream)
+			if got := <-stream.Complete; got != StreamFailed {
+				t.Fatalf("error stream completion=%q, want %q", got, StreamFailed)
+			}
+			if strings.Contains(body, "response.completed") || strings.Contains(body, "data: [DONE]") || strings.Contains(body, "message_stop") {
+				t.Fatalf("error stream emitted successful terminal: %q", body)
+			}
+		})
+	}
+}
+
+func TestEnsureResponsesTerminalStopsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	input := make(chan StreamChunk)
+	guarded := ensureResponsesTerminal(ctx, &StreamResult{Status: http.StatusOK, Chunks: input}, "gpt-5")
+	done := make(chan struct{})
+	go func() {
+		collectStream(t, guarded)
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stream wrapper did not stop after context cancellation")
+	}
+	if got := <-guarded.Complete; got != StreamCanceled {
+		t.Fatalf("completion=%q, want %q", got, StreamCanceled)
+	}
+}
+
 func collectStream(t *testing.T, result *StreamResult) (string, []string, []error) {
 	t.Helper()
 	var body strings.Builder
@@ -470,4 +611,54 @@ func responseFailedPayload(t *testing.T, body string) string {
 		t.Fatalf("invalid response.failed payload: %q", payload)
 	}
 	return payload
+}
+
+func TestStreamEventStatus(t *testing.T) {
+	tests := []struct {
+		name     string
+		lines    []string
+		terminal bool
+		success  bool
+	}{
+		{name: "openai done", lines: []string{"data: [DONE]"}, terminal: true, success: true},
+		{name: "responses completed", lines: []string{"event: response.completed", `data: {"type":"response.completed"}`}, terminal: true, success: true},
+		{name: "responses failed", lines: []string{"event: response.failed", `data: {"type":"response.failed"}`}, terminal: true, success: false},
+		{name: "responses missing data", lines: []string{"event: response.completed"}, terminal: false},
+		{name: "chat json error", lines: []string{`data: {"error":{"message":"busy"}}`}, terminal: true, success: false},
+		{name: "chat null error", lines: []string{`data: {"error":null,"choices":[]}`}, terminal: false},
+		{name: "content", lines: []string{`data: {"type":"response.output_text.delta"}`}, terminal: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lines := make([][]byte, len(tt.lines))
+			for i := range tt.lines {
+				lines[i] = []byte(tt.lines[i])
+			}
+			terminal, success := streamEventStatus(lines...)
+			if terminal != tt.terminal || success != tt.success {
+				t.Fatalf("status=(%v,%v), want (%v,%v)", terminal, success, tt.terminal, tt.success)
+			}
+		})
+	}
+}
+
+func TestStreamCompletionFromBody(t *testing.T) {
+	if got := streamCompletionFromBody([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"), streamProtocolClaude); got != StreamCompleted {
+		t.Fatalf("Claude completion=%q, want %q", got, StreamCompleted)
+	}
+	if got := streamCompletionFromBody([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}"), streamProtocolClaude); got == StreamCompleted {
+		t.Fatalf("unterminated Claude event reported completion")
+	}
+	if got := streamCompletionFromBody([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\nevent: error\ndata: {\"type\":\"error\"}\n\n"), streamProtocolClaude); got != StreamFailed {
+		t.Fatalf("error after terminal completion=%q, want %q", got, StreamFailed)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	if got := parseRetryAfter("2"); got != 2*time.Second {
+		t.Fatalf("numeric Retry-After = %s, want 2s", got)
+	}
+	if got := parseRetryAfter(""); got != 0 {
+		t.Fatalf("empty Retry-After = %s, want 0", got)
+	}
 }

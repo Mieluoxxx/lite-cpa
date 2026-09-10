@@ -233,6 +233,10 @@ channel-affinity: [claude, gpt, grok]
 
 Sticky identity catalog: `internal/affinity/cli_sessions.go`. First present wins: product headers (`X-Claude-Code-Session-Id`, `x-opencode-session`, `x-session-affinity`) → Codex/Pi session/thread → `X-Session-Id` → `X-Client-Request-Id` → protocol body (`/v1/messages` normalizes `metadata.user_id`; responses/chat use `prompt_cache_key`). Details: [Channel Affinity and Retry](docs/Channel-Affinity-and-Retry.md). No identity → normal round-robin.
 
+### Optional adaptive routing
+
+The default `routing.strategy: priority` preserves the existing provider/key order. `routing.strategy: adaptive` ranks only within the same provider and entry-priority tier using decay-weighted Beta reliability; affinity and cooldown gates remain authoritative. `half-life` defaults to `72h`; `shadow: true` collects scores and recommendations without changing picks. Cold-start keys use a neutral prior and at most one deterministic same-tier exploration every ten non-affinity selections; quota estimation and randomized Thompson sampling are intentionally not enabled here.
+
 ### Request log
 
 | Field | Meaning |

@@ -27,6 +27,15 @@ debug: false
 channel-affinity: [claude, gpt, gemini, grok, glm, kimi, qwen, minimax]
 # channel-affinity: false
 
+# Optional same-priority reliability-aware key selection.
+# 可选的同优先级可靠性自适应选 key。
+# Default is priority (historical provider/key order). Use shadow: true to
+# collect reliability data without changing selection.
+# routing:
+#   strategy: priority   # priority | adaptive
+#   half-life: 72h
+#   shadow: false
+
 request-log:
   enabled: false
   backend: "sqlite"          # sqlite | postgres

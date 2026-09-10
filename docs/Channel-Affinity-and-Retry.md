@@ -244,6 +244,22 @@ Same client model `alias` across providers is **merged** into one pool. Selectio
 | `switch-on-success` | true | Pin the key that actually worked |
 | `failover-mode` | `key` unless set | Explicit `provider` on relays |
 
+### Cross-request health gate
+
+In addition to affinity, lite-cpa keeps short-lived in-memory health state per
+`model alias + UpstreamKey.ID`. A 401/403, 429, timeout, or upstream 5xx/network
+failure temporarily cools the affected key; provider-scoped failures also cool
+that provider **for the current model alias** when `failover-mode: provider` is
+configured. Cooldowns honor an
+upstream `Retry-After`. Expired cooldowns use one half-open probe, so concurrent
+requests do not stampede a recovering key.
+
+Adaptive routing is opt-in via `routing.strategy: adaptive`: it ranks only within the same provider and entry-priority tier using decay-weighted Beta reliability. `shadow: true` records recommendations without changing picks; priority order remains the default. Request cancellation and malformed-request errors do not count as upstream health failures. A config reload clears health and affinity state, and in-flight results from the old generation cannot write back.
+`GET /api/routing/stats` returns non-secret key health counters and active
+cooldowns. `last_first_chunk_ms` measures the first client-visible translated
+chunk, not upstream TTFB; omitted `last_output_tokens` means usage was not
+reported.
+
 ---
 
 ## Common pitfalls (“old channel still hit”)
@@ -251,7 +267,7 @@ Same client model `alias` across providers is **merged** into one pool. Selectio
 1. **TTL still valid** — pin remains until 600s (or `default-ttl-seconds`) elapses.
 2. **`skip-retry-on-failure: true`** (custom rules) — this request will not rotate after sticky failure.
 3. **Relay with `failover-mode: key`** — rotates keys on the same dead site. Use `provider`.
-4. **New high-priority provider added** — existing pins still prefer the old key until clear/expire.
+4. **New high-priority provider added** — existing pins still prefer the old key until clear/expire; a config reload clears all old pins.
 5. **No identity field** — affinity never engages; pure RR. Common when the reverse proxy strips session headers or the client never sends `prompt_cache_key` / `metadata.user_id`.
 6. **Process restart** — memory cache is empty (no Redis).
 7. **Kimi** — stickiness needs body `prompt_cache_key`; device headers are not session keys.

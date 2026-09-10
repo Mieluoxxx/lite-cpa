@@ -237,6 +237,19 @@ func (m *Manager) Clear(cacheKey string) {
 	m.mu.Unlock()
 }
 
+// Reset drops all sticky bindings. Config reloads create a new registry
+// generation, so an old key ID must not be reused by a replacement credential.
+func (m *Manager) Reset() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	cleared := int64(len(m.entries))
+	m.entries = make(map[string]cacheEntry)
+	m.approx.Add(-cleared)
+	m.mu.Unlock()
+}
+
 // ResolvePreferred returns the key with ID == preferredID if present and not tried.
 func ResolvePreferred(keys []registry.UpstreamKey, preferredID string, tried map[string]struct{}) (registry.UpstreamKey, bool) {
 	if preferredID == "" {

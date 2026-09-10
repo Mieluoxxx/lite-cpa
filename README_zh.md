@@ -233,6 +233,10 @@ channel-affinity: [claude, gpt, grok]
 
 亲和身份总表：`internal/affinity/cli_sessions.go`。优先级：产品头（`X-Claude-Code-Session-Id`、`x-opencode-session`、`x-session-affinity`）→ Codex/Pi session/thread → `X-Session-Id` → `X-Client-Request-Id` → 协议 body（`/v1/messages` 归一化 `metadata.user_id`；responses/chat 用 `prompt_cache_key`）。详见 [渠道亲和与重试](docs/渠道亲和与重试.md)。无身份 → 普通轮询。
 
+### 自适应路由（可选）
+
+默认 `routing.strategy: priority`，保持原有 provider/key 优先级。设置 `routing.strategy: adaptive` 后，仅在相同 provider priority 与 entry priority 内按时间衰减的 Beta 可靠性期望值择优；亲和和冷却门禁仍优先。`half-life` 默认 `72h`，`shadow: true` 只采集分数并给出推荐、不改变实际选择。无样本 key 使用中性先验和确定性轮询，每 10 次非亲和选择最多做一次同档冷启动探索，不引入随机 Thompson Sampling。
+
 ### 请求记录
 
 | 字段 | 含义 |

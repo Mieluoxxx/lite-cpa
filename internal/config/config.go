@@ -35,10 +35,29 @@ type Config struct {
 	// (new-api style rule stickiness; process-local memory cache).
 	ChannelAffinity ChannelAffinitySetting `yaml:"channel-affinity"`
 
+	// Routing controls optional same-priority adaptive key selection.
+	Routing RoutingConfig `yaml:"routing"`
+
 	AnthropicMessages []Provider `yaml:"anthropic-messages"`
 	OpenAIResponses   []Provider `yaml:"openai-responses"`
 	OpenAICompletions []Provider `yaml:"openai-completions"`
 	OpenAIImages      []Provider `yaml:"openai-images"`
+}
+
+// RoutingConfig controls the opt-in reliability-aware selector.
+// Strategy defaults to priority, preserving the historical provider/key order.
+type RoutingConfig struct {
+	Strategy string `yaml:"strategy,omitempty"`  // priority | adaptive
+	HalfLife string `yaml:"half-life,omitempty"` // Go duration; default 72h
+	Shadow   bool   `yaml:"shadow,omitempty"`    // collect scores without changing picks
+}
+
+func (r RoutingConfig) HalfLifeDuration() time.Duration {
+	d, err := time.ParseDuration(r.HalfLife)
+	if err != nil || d <= 0 {
+		return 72 * time.Hour
+	}
+	return d
 }
 
 // ChannelAffinityKeySource extracts a sticky identity from the request.
@@ -278,6 +297,14 @@ func (c *Config) applyDefaults() {
 	if c.RequestLog.SQLite.Path == "" {
 		c.RequestLog.SQLite.Path = "logs/requests.db"
 	}
+	if strings.TrimSpace(c.Routing.Strategy) == "" {
+		c.Routing.Strategy = "priority"
+	} else {
+		c.Routing.Strategy = strings.ToLower(strings.TrimSpace(c.Routing.Strategy))
+	}
+	if strings.TrimSpace(c.Routing.HalfLife) == "" {
+		c.Routing.HalfLife = "72h"
+	}
 	if c.ChannelAffinity.MaxEntries <= 0 {
 		c.ChannelAffinity.MaxEntries = 100_000
 	}
@@ -400,6 +427,20 @@ func (c *Config) validate() error {
 	}
 	if len(c.AnthropicMessages) == 0 && len(c.OpenAIResponses) == 0 && len(c.OpenAICompletions) == 0 {
 		return fmt.Errorf("at least one upstream provider is required")
+	}
+	strategy := strings.ToLower(strings.TrimSpace(c.Routing.Strategy))
+	if strategy == "" {
+		strategy = "priority"
+	}
+	if strategy != "priority" && strategy != "adaptive" {
+		return fmt.Errorf("routing.strategy must be priority or adaptive, got %q", c.Routing.Strategy)
+	}
+	halfLifeValue := strings.TrimSpace(c.Routing.HalfLife)
+	if halfLifeValue == "" {
+		halfLifeValue = "72h"
+	}
+	if halfLife, err := time.ParseDuration(halfLifeValue); err != nil || halfLife <= 0 {
+		return fmt.Errorf("routing.half-life must be a positive Go duration, got %q", c.Routing.HalfLife)
 	}
 	for _, group := range [][]Provider{c.AnthropicMessages, c.OpenAIResponses, c.OpenAICompletions} {
 		for i, p := range group {
