@@ -40,8 +40,8 @@ func main() {
 		}
 	}()
 	if cfg.RequestLog.Enabled {
-		log.Printf("request-log enabled backend=%s retention=%s store-body=%v",
-			cfg.RequestLog.Backend, cfg.RequestLog.Retention, cfg.RequestLog.StoreBody)
+		log.Printf("request-log enabled backend=%s retention=%s store-body=%v body-retention=%s",
+			cfg.RequestLog.Backend, cfg.RequestLog.Retention, cfg.RequestLog.StoreBody, cfg.RequestLog.BodyRetention)
 	}
 
 	srv := server.New(cfg, logger)

@@ -198,10 +198,15 @@ func (s ChannelAffinitySetting) ResolvedRules() []ChannelAffinityRule {
 // RequestLogConfig controls optional request recording.
 // Disabled by default. When enabled, metadata is stored; bodies are optional.
 type RequestLogConfig struct {
-	Enabled   bool   `yaml:"enabled"`
-	Backend   string `yaml:"backend"`   // "sqlite" | "postgres"
-	Retention string `yaml:"retention"` // Go duration, e.g. "168h", "7d" not valid — use 168h
+	Enabled bool   `yaml:"enabled"`
+	Backend string `yaml:"backend"` // "sqlite" | "postgres"
+	// Retention deletes whole rows older than this Go duration ("168h"; "7d" is
+	// not valid). "0s" (the default) keeps metadata forever.
+	Retention string `yaml:"retention"`
 	StoreBody bool   `yaml:"store-body"`
+	// BodyRetention clears stored request/response bodies older than this while
+	// keeping the metadata row. Only matters when store-body is on. "0s" never clears.
+	BodyRetention string `yaml:"body-retention"`
 
 	SQLite   SQLiteLogConfig   `yaml:"sqlite"`
 	Postgres PostgresLogConfig `yaml:"postgres"`
@@ -292,7 +297,10 @@ func (c *Config) applyDefaults() {
 		c.RequestLog.Backend = "sqlite"
 	}
 	if c.RequestLog.Retention == "" {
-		c.RequestLog.Retention = "168h" // 7 days
+		c.RequestLog.Retention = "0s"
+	}
+	if c.RequestLog.BodyRetention == "" {
+		c.RequestLog.BodyRetention = "168h"
 	}
 	if c.RequestLog.SQLite.Path == "" {
 		c.RequestLog.SQLite.Path = "logs/requests.db"
@@ -488,6 +496,9 @@ func (c *Config) validate() error {
 		}
 		if _, err := time.ParseDuration(c.RequestLog.Retention); err != nil {
 			return fmt.Errorf("request-log.retention: %w", err)
+		}
+		if _, err := time.ParseDuration(c.RequestLog.BodyRetention); err != nil {
+			return fmt.Errorf("request-log.body-retention: %w", err)
 		}
 	}
 	return nil

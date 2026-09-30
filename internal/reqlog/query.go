@@ -2,6 +2,7 @@ package reqlog
 
 import (
 	"context"
+	"time"
 )
 
 // ListFilter selects a page of request logs for the monitor API.
@@ -14,6 +15,12 @@ type ListFilter struct {
 	Status     string // "2xx", "4xx", "5xx", etc.
 	Outcome    string
 	ErrorsOnly bool
+	// From/To bound ts as [From, To); zero means unbounded. Bounding keeps
+	// queries on the ts index once history is kept forever.
+	From time.Time
+	To   time.Time
+	// UserAgents, when non-nil, keeps only rows whose user_agent is listed.
+	UserAgents []string
 }
 
 // Stats is aggregate request-log metrics for the monitor dashboard.

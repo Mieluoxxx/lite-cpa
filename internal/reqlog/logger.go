@@ -12,9 +12,13 @@ import (
 
 // Logger wraps a Store with async insert and retention cleanup.
 type Logger struct {
-	store     Store
-	storeBody bool
-	retention time.Duration
+	store         Store
+	storeBody     bool
+	retention     time.Duration
+	bodyRetention time.Duration
+	// bodiesClearedTo lets hourly body cleanup scan only the newly expired
+	// window instead of the whole table; zero until the first pass.
+	bodiesClearedTo time.Time
 
 	ch     chan Record
 	done   chan struct{}
@@ -27,7 +31,11 @@ func Open(cfg config.RequestLogConfig) (*Logger, error) {
 		// Disabled: no worker, no channel. Enabled() is false.
 		return &Logger{store: Noop{}}, nil
 	}
-	retention, err := time.ParseDuration(cfg.Retention)
+	retention, err := parseRetention(cfg.Retention)
+	if err != nil {
+		return nil, err
+	}
+	bodyRetention, err := parseRetention(cfg.BodyRetention)
 	if err != nil {
 		return nil, err
 	}
@@ -44,16 +52,25 @@ func Open(cfg config.RequestLogConfig) (*Logger, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &Logger{
-		store:     store,
-		storeBody: cfg.StoreBody,
-		retention: retention,
-		ch:        make(chan Record, 256),
-		done:      make(chan struct{}),
-		cancel:    cancel,
+		store:         store,
+		storeBody:     cfg.StoreBody,
+		retention:     retention,
+		bodyRetention: bodyRetention,
+		ch:            make(chan Record, 256),
+		done:          make(chan struct{}),
+		cancel:        cancel,
 	}
 	l.wg.Add(1)
 	go l.loop(ctx)
 	return l, nil
+}
+
+// Retention reports the row and body retention fixed at Open; 0 keeps forever.
+func (l *Logger) Retention() (rows, bodies time.Duration) {
+	if l == nil {
+		return 0, 0
+	}
+	return l.retention, l.bodyRetention
 }
 
 func (l *Logger) Enabled() bool {
@@ -164,20 +181,43 @@ func (l *Logger) insert(parent context.Context, r Record) {
 	}
 }
 
+// parseRetention treats an empty value like "0s": keep forever.
+func parseRetention(raw string) (time.Duration, error) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, nil
+	}
+	return time.ParseDuration(raw)
+}
+
 func (l *Logger) cleanup(parent context.Context) {
-	if l.retention <= 0 {
-		return
-	}
-	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-	defer cancel()
-	n, err := l.store.DeleteOlderThan(ctx, time.Now().Add(-l.retention))
-	if err != nil {
-		if parent.Err() == nil {
-			log.Printf("request-log retention: %v", err)
+	now := time.Now()
+	if l.retention > 0 {
+		ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+		n, err := l.store.DeleteOlderThan(ctx, now.Add(-l.retention))
+		cancel()
+		if err != nil {
+			if parent.Err() == nil {
+				log.Printf("request-log retention: %v", err)
+			}
+		} else if n > 0 {
+			log.Printf("request-log retention: deleted %d rows older than %s", n, l.retention)
 		}
-		return
 	}
-	if n > 0 {
-		log.Printf("request-log retention: deleted %d rows older than %s", n, l.retention)
+	if l.bodyRetention > 0 {
+		cutoff := now.Add(-l.bodyRetention)
+		// The first pass has no lower bound and may scan a large table.
+		ctx, cancel := context.WithTimeout(parent, time.Minute)
+		n, err := l.store.StripBodies(ctx, l.bodiesClearedTo, cutoff)
+		cancel()
+		if err != nil {
+			if parent.Err() == nil {
+				log.Printf("request-log body-retention: %v", err)
+			}
+			return
+		}
+		l.bodiesClearedTo = cutoff
+		if n > 0 {
+			log.Printf("request-log body-retention: cleared bodies of %d rows older than %s", n, l.bodyRetention)
+		}
 	}
 }

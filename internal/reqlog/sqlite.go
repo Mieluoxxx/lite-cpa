@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
   output_tokens INTEGER NOT NULL DEFAULT 0,
   cached_tokens INTEGER NOT NULL DEFAULT 0,
   usage_complete INTEGER NOT NULL DEFAULT 0,
+  retried INTEGER NOT NULL DEFAULT 0,
   error TEXT NOT NULL DEFAULT '',
   req_body TEXT NOT NULL DEFAULT '',
   resp_body TEXT NOT NULL DEFAULT ''
@@ -66,25 +67,125 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_ts ON request_logs(ts);
 	if err := s.migrateTsToIntegerIfNeeded(); err != nil {
 		return err
 	}
-	if err := s.addColumns(); err != nil {
+	added, err := s.addColumns()
+	if err != nil {
 		return err
 	}
-	return s.backfillOutcome()
+	if err := s.backfillOutcome(); err != nil {
+		return err
+	}
+	if added["retried"] {
+		if err := s.backfillRetried(); err != nil {
+			return fmt.Errorf("backfill retried: %w", err)
+		}
+	}
+	return s.ensureUsageHourly()
 }
 
-func (s *SQLiteStore) addColumns() error {
+// addColumns upgrades older schemas and reports which columns it added.
+func (s *SQLiteStore) addColumns() (map[string]bool, error) {
+	added := make(map[string]bool)
 	for _, column := range []string{
 		"input_tokens INTEGER NOT NULL DEFAULT 0",
 		"output_tokens INTEGER NOT NULL DEFAULT 0",
 		"cached_tokens INTEGER NOT NULL DEFAULT 0",
 		"outcome TEXT NOT NULL DEFAULT ''",
 		"usage_complete INTEGER NOT NULL DEFAULT 0",
+		"retried INTEGER NOT NULL DEFAULT 0",
 	} {
-		if _, err := s.db.Exec(`ALTER TABLE request_logs ADD COLUMN ` + column); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-			return fmt.Errorf("add %s: %w", strings.Fields(column)[0], err)
+		name := strings.Fields(column)[0]
+		if _, err := s.db.Exec(`ALTER TABLE request_logs ADD COLUMN ` + column); err != nil {
+			if !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+				return nil, fmt.Errorf("add %s: %w", name, err)
+			}
+			continue
+		}
+		added[name] = true
+	}
+	return added, nil
+}
+
+// backfillRetried infers the flag for rows written before it existed: every
+// row except the last one of a request_id was superseded by a later attempt.
+func (s *SQLiteStore) backfillRetried() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, stmt := range []string{
+		// A temp table plus index keeps this O(n log n); a correlated subquery
+		// on the unindexed request_id would be quadratic on large tables.
+		`CREATE TEMP TABLE retried_last AS
+SELECT request_id, MAX(id) AS last_id FROM request_logs
+WHERE request_id <> '' GROUP BY request_id HAVING COUNT(*) > 1`,
+		`CREATE INDEX temp.idx_retried_last ON retried_last(request_id)`,
+		`UPDATE request_logs SET retried = 1
+WHERE id < (SELECT last_id FROM retried_last WHERE retried_last.request_id = request_logs.request_id)`,
+		`DROP TABLE retried_last`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
 		}
 	}
-	return nil
+	return tx.Commit()
+}
+
+// ensureUsageHourly creates the rollup table and, when it is new, fills it
+// from existing rows in the same transaction so a crash just retries.
+// WITHOUT ROWID stores rows in the primary key b-tree; a rowid table would
+// keep a second copy of (hour, user_agent, model) in an auto index.
+func (s *SQLiteStore) ensureUsageHourly() error {
+	var exists int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'usage_hourly'`).Scan(&exists); err != nil {
+		return err
+	}
+	if exists > 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`
+CREATE TABLE usage_hourly (
+  hour INTEGER NOT NULL,
+  user_agent TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  requests INTEGER NOT NULL DEFAULT 0,
+  success INTEGER NOT NULL DEFAULT 0,
+  errors INTEGER NOT NULL DEFAULT 0,
+  canceled INTEGER NOT NULL DEFAULT 0,
+  incomplete INTEGER NOT NULL DEFAULT 0,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_tokens INTEGER NOT NULL DEFAULT 0,
+  last_seen_ms INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (hour, user_agent, model)
+) WITHOUT ROWID`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+INSERT INTO usage_hourly (hour, user_agent, model, attempts, requests, success, errors, canceled, incomplete,
+  input_tokens, output_tokens, cached_tokens, last_seen_ms)
+SELECT ts / 1000000000 / 3600 * 3600, user_agent, model,
+  COUNT(*),
+  SUM(CASE WHEN retried THEN 0 ELSE 1 END),
+  SUM(CASE WHEN NOT retried AND outcome = 'completed' THEN 1 ELSE 0 END),
+  SUM(CASE WHEN NOT retried AND outcome = 'error' THEN 1 ELSE 0 END),
+  SUM(CASE WHEN NOT retried AND outcome = 'client_canceled' THEN 1 ELSE 0 END),
+  SUM(CASE WHEN NOT retried AND NOT usage_complete THEN 1 ELSE 0 END),
+  SUM(CASE WHEN usage_complete THEN input_tokens ELSE 0 END),
+  SUM(CASE WHEN usage_complete THEN output_tokens ELSE 0 END),
+  SUM(CASE WHEN usage_complete THEN cached_tokens ELSE 0 END),
+  MAX(ts) / 1000000
+FROM request_logs
+GROUP BY 1, 2, 3`); err != nil {
+		return fmt.Errorf("backfill usage_hourly: %w", err)
+	}
+	return tx.Commit()
 }
 
 func (s *SQLiteStore) backfillOutcome() error {
@@ -264,11 +365,16 @@ func isAllDigits(s string) bool {
 
 func (s *SQLiteStore) Insert(ctx context.Context, r Record) error {
 	r = normalizeRecord(r)
-	_, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `
 INSERT INTO request_logs (
   request_id, ts, method, path, status_code, outcome, model, protocol, provider, upstream,
-  user_agent, duration_ms, input_tokens, output_tokens, cached_tokens, usage_complete, error, req_body, resp_body
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  user_agent, duration_ms, input_tokens, output_tokens, cached_tokens, usage_complete, retried, error, req_body, resp_body
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.RequestID,
 		r.Timestamp.UTC().UnixNano(),
 		r.Method,
@@ -285,11 +391,35 @@ INSERT INTO request_logs (
 		r.OutputTokens,
 		r.CachedTokens,
 		r.UsageComplete,
+		r.Retried,
 		r.Error,
 		r.ReqBody,
 		r.RespBody,
-	)
-	return err
+	); err != nil {
+		return err
+	}
+	d := usageDelta(r)
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO usage_hourly (hour, user_agent, model, attempts, requests, success, errors, canceled, incomplete,
+  input_tokens, output_tokens, cached_tokens, last_seen_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (hour, user_agent, model) DO UPDATE SET
+  attempts = attempts + excluded.attempts,
+  requests = requests + excluded.requests,
+  success = success + excluded.success,
+  errors = errors + excluded.errors,
+  canceled = canceled + excluded.canceled,
+  incomplete = incomplete + excluded.incomplete,
+  input_tokens = input_tokens + excluded.input_tokens,
+  output_tokens = output_tokens + excluded.output_tokens,
+  cached_tokens = cached_tokens + excluded.cached_tokens,
+  last_seen_ms = MAX(last_seen_ms, excluded.last_seen_ms)`,
+		d.Hour, d.UserAgent, d.Model, d.Attempts, d.Requests, d.Success, d.Errors, d.Canceled, d.Incomplete,
+		d.InputTokens, d.OutputTokens, d.CachedTokens, d.LastSeenMS,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *SQLiteStore) DeleteOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
@@ -298,6 +428,41 @@ func (s *SQLiteStore) DeleteOlderThan(ctx context.Context, cutoff time.Time) (in
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+func (s *SQLiteStore) StripBodies(ctx context.Context, after, before time.Time) (int64, error) {
+	q := `UPDATE request_logs SET req_body = '', resp_body = '' WHERE ts < ? AND (req_body <> '' OR resp_body <> '')`
+	args := []any{before.UTC().UnixNano()}
+	if !after.IsZero() {
+		q += ` AND ts >= ?`
+		args = append(args, after.UTC().UnixNano())
+	}
+	res, err := s.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (s *SQLiteStore) Usage(ctx context.Context, from, to time.Time) ([]UsageBucket, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT hour, user_agent, model, attempts, requests, success, errors, canceled, incomplete,
+  input_tokens, output_tokens, cached_tokens, last_seen_ms
+FROM usage_hourly WHERE hour >= ? AND hour < ? ORDER BY hour`, from.Unix(), to.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []UsageBucket{}
+	for rows.Next() {
+		var b UsageBucket
+		if err := rows.Scan(&b.Hour, &b.UserAgent, &b.Model, &b.Attempts, &b.Requests, &b.Success, &b.Errors, &b.Canceled, &b.Incomplete,
+			&b.InputTokens, &b.OutputTokens, &b.CachedTokens, &b.LastSeenMS); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
 }
 
 func (s *SQLiteStore) Clear(ctx context.Context) (int64, error) {
@@ -323,7 +488,7 @@ func (s *SQLiteStore) List(ctx context.Context, f ListFilter) ([]Record, int64, 
 	}
 
 	q := `SELECT id, request_id, ts, method, path, status_code, outcome, model, protocol, provider, upstream,
-  user_agent, duration_ms, input_tokens, output_tokens, cached_tokens, usage_complete, error, req_body, resp_body
+  user_agent, duration_ms, input_tokens, output_tokens, cached_tokens, usage_complete, retried, error, req_body, resp_body
 FROM request_logs` + where + ` ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`
 	listArgs := append(append([]any{}, args...), f.Limit, f.Offset)
 	rows, err := s.db.QueryContext(ctx, q, listArgs...)
@@ -339,7 +504,7 @@ FROM request_logs` + where + ` ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`
 		if err := rows.Scan(
 			&r.ID, &r.RequestID, &ts, &r.Method, &r.Path, &r.StatusCode, &r.Outcome,
 			&r.Model, &r.Protocol, &r.Provider, &r.Upstream,
-			&r.UserAgent, &r.DurationMS, &r.InputTokens, &r.OutputTokens, &r.CachedTokens, &r.UsageComplete, &r.Error, &r.ReqBody, &r.RespBody,
+			&r.UserAgent, &r.DurationMS, &r.InputTokens, &r.OutputTokens, &r.CachedTokens, &r.UsageComplete, &r.Retried, &r.Error, &r.ReqBody, &r.RespBody,
 		); err != nil {
 			return nil, 0, err
 		}

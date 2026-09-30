@@ -75,6 +75,7 @@ func New(cfg *config.Config, logger *reqlog.Logger) *Server {
 	mux.HandleFunc("GET /api/logs", s.handleLogsList)
 	mux.HandleFunc("DELETE /api/logs", s.handleLogsClear)
 	mux.HandleFunc("GET /api/logs/stats", s.handleLogsStats)
+	mux.HandleFunc("GET /api/usage", s.handleUsage)
 	mux.HandleFunc("GET /api/affinity/stats", s.handleAffinityStats)
 	mux.HandleFunc("GET /api/routing/stats", s.handleRoutingStats)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -146,7 +147,7 @@ func (s *Server) Reload(cfg *config.Config) error {
 		merged.Port = old.Port
 	}
 	if requestLogIdentity(old.RequestLog) != requestLogIdentity(cfg.RequestLog) {
-		deferred = append(deferred, "request-log enabled/backend/path/dsn/retention")
+		deferred = append(deferred, "request-log enabled/backend/path/dsn/retention/body-retention")
 		storeBody := merged.RequestLog.StoreBody // store-body stays hot-reloadable
 		merged.RequestLog = old.RequestLog
 		merged.RequestLog.StoreBody = storeBody
@@ -179,12 +180,13 @@ func (s *Server) Reload(cfg *config.Config) error {
 }
 
 func requestLogIdentity(c config.RequestLogConfig) string {
-	return fmt.Sprintf("%t|%s|%s|%s|%s",
+	return fmt.Sprintf("%t|%s|%s|%s|%s|%s",
 		c.Enabled,
 		strings.ToLower(strings.TrimSpace(c.Backend)),
 		strings.TrimSpace(c.SQLite.Path),
 		strings.TrimSpace(c.Postgres.DSN),
 		strings.TrimSpace(c.Retention),
+		strings.TrimSpace(c.BodyRetention),
 	)
 }
 
@@ -195,7 +197,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"name":"lite-cpa","endpoints":["GET /dashboard","GET /dashboard.html","GET /api/logs","DELETE /api/logs","GET /api/logs/stats","GET /api/affinity/stats","GET /api/routing/stats","GET /v1/models","POST /v1/chat/completions","POST /v1/responses","POST /v1/messages","POST /v1/images/generations","POST /v1/images/edits"]}`))
+	_, _ = w.Write([]byte(`{"name":"lite-cpa","endpoints":["GET /dashboard","GET /dashboard.html","GET /api/logs","DELETE /api/logs","GET /api/logs/stats","GET /api/usage","GET /api/affinity/stats","GET /api/routing/stats","GET /v1/models","POST /v1/chat/completions","POST /v1/responses","POST /v1/messages","POST /v1/images/generations","POST /v1/images/edits"]}`))
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
@@ -253,8 +255,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, source tran
 }
 
 func (s *Server) logReq(id string, r *http.Request, protocol, model, provider, upstream string, status int, outcome string, start time.Time, errMsg string, reqBody, respBody []byte, usage ...tokenUsage) {
+	if rec, ok := s.newLogRecord(id, r, protocol, model, provider, upstream, status, outcome, start, errMsg, reqBody, respBody, usage...); ok {
+		s.logger.Record(rec)
+	}
+}
+
+// newLogRecord builds a request-log row; ok is false when logging is off.
+func (s *Server) newLogRecord(id string, r *http.Request, protocol, model, provider, upstream string, status int, outcome string, start time.Time, errMsg string, reqBody, respBody []byte, usage ...tokenUsage) (reqlog.Record, bool) {
 	if s.logger == nil || !s.logger.Enabled() {
-		return
+		return reqlog.Record{}, false
 	}
 	rec := reqlog.Record{
 		RequestID:  id,
@@ -284,7 +293,40 @@ func (s *Server) logReq(id string, r *http.Request, protocol, model, provider, u
 		rec.ReqBody = truncate(string(reqBody), 64<<10)
 		rec.RespBody = truncate(string(respBody), 64<<10)
 	}
-	s.logger.Record(rec)
+	return rec, true
+}
+
+// requestLog orders the rows of one client request. A retriable failure is
+// held until the next attempt starts (written as retried) or the request ends
+// (written as the final row), so usage stats see exactly one final row per
+// request while the failed attempt stays visible in the log.
+type requestLog struct {
+	logger  *reqlog.Logger
+	pending *reqlog.Record
+}
+
+func (l *requestLog) hold(rec reqlog.Record, ok bool) {
+	l.flush(true)
+	if ok {
+		l.pending = &rec
+	}
+}
+
+func (l *requestLog) emit(rec reqlog.Record, ok bool) {
+	l.flush(true)
+	if ok {
+		l.logger.Record(rec)
+	}
+}
+
+func (l *requestLog) flush(retried bool) {
+	if l.pending == nil {
+		return
+	}
+	rec := *l.pending
+	l.pending = nil
+	rec.Retried = retried
+	l.logger.Record(rec)
 }
 
 func (s *Server) observeAttempt(reqID string, attempt int, model string, key registry.UpstreamKey, lease pool.Lease, status int, outcome pool.AttemptOutcome, startedAt, firstByteAt time.Time, retryAfter ...time.Duration) {
@@ -439,6 +481,8 @@ func (s *Server) forward(
 	body []byte, start time.Time,
 	execute func(ctx context.Context, key registry.UpstreamKey, upstreamModel string) (any, error),
 ) {
+	rows := &requestLog{logger: s.logger}
+	defer rows.flush(false)
 	s.stateMu.RLock()
 	requestGeneration := s.health.Generation()
 	aff := s.affinity.Lookup(resolveName, r.URL.Path, r.Header, body)
@@ -545,6 +589,7 @@ func (s *Server) forward(
 			preferredLease = pool.Lease{}
 		}
 		tried[key.ID] = struct{}{}
+		rows.flush(true)
 		lastKey = key
 
 		if thinking.ParseSuffix(model).HasSuffix {
@@ -564,7 +609,7 @@ func (s *Server) forward(
 			cancelAttempt()
 			if ctxErr := r.Context().Err(); ctxErr != nil {
 				s.observeAttempt(reqID, attempt, resolveName, key, lease, 0, pool.OutcomeCanceled, attemptStart, time.Time{})
-				s.logReq(reqID, r, protocol, model, key.Provider, key.Name, 0, reqlog.OutcomeClientCanceled, attemptStart, ctxErr.Error(), body, nil)
+				rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, 0, reqlog.OutcomeClientCanceled, attemptStart, ctxErr.Error(), body, nil))
 				return
 			}
 			lastErr = err
@@ -573,7 +618,7 @@ func (s *Server) forward(
 				if se.Code == 401 || se.Code == 403 || se.Code == 429 || se.Code >= 500 {
 					clearAffinity(key.ID)
 					s.observeAttempt(reqID, attempt, resolveName, key, lease, se.Code, classifyAttempt(err, se.Code), attemptStart, time.Time{}, se.RetryAfter)
-					s.logReq(reqID, r, protocol, model, key.Provider, key.Name, se.Code, reqlog.OutcomeError, attemptStart, se.Error(), body, nil)
+					rows.hold(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, se.Code, reqlog.OutcomeError, attemptStart, se.Error(), body, nil))
 					lastErrLogged = true
 					if s.debugEnabled() {
 						log.Printf("upstream %s/%s failed status=%d, rotating (mode=%s)", key.Name, key.ID, se.Code, key.FailoverMode)
@@ -594,12 +639,12 @@ func (s *Server) forward(
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(se.Code)
 				_, _ = w.Write(errBody)
-				s.logReq(reqID, r, protocol, model, key.Provider, key.Name, se.Code, reqlog.OutcomeError, start, se.Error(), body, errBody)
+				rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, se.Code, reqlog.OutcomeError, start, se.Error(), body, errBody))
 				return
 			}
 			clearAffinity(key.ID)
 			s.observeAttempt(reqID, attempt, resolveName, key, lease, http.StatusBadGateway, classifyAttempt(err, 0), attemptStart, time.Time{})
-			s.logReq(reqID, r, protocol, model, key.Provider, key.Name, http.StatusBadGateway, reqlog.OutcomeError, attemptStart, err.Error(), body, nil)
+			rows.hold(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, http.StatusBadGateway, reqlog.OutcomeError, attemptStart, err.Error(), body, nil))
 			lastErrLogged = true
 			if aff.Found && aff.SkipRetry && key.ID == aff.KeyID {
 				break
@@ -615,7 +660,7 @@ func (s *Server) forward(
 		if ctxErr := r.Context().Err(); ctxErr != nil {
 			cancelAttempt()
 			s.observeAttempt(reqID, attempt, resolveName, key, lease, 0, pool.OutcomeCanceled, attemptStart, time.Time{})
-			s.logReq(reqID, r, protocol, model, key.Provider, key.Name, 0, reqlog.OutcomeClientCanceled, attemptStart, ctxErr.Error(), body, nil)
+			rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, 0, reqlog.OutcomeClientCanceled, attemptStart, ctxErr.Error(), body, nil))
 			return
 		}
 
@@ -641,7 +686,7 @@ func (s *Server) forward(
 				s.observeAttempt(reqID, attempt, resolveName, key, lease, v.Status, pool.OutcomeCanceled, attemptStart, time.Time{})
 			}
 			cancelAttempt()
-			s.logReq(reqID, r, protocol, model, key.Provider, key.Name, http.StatusOK, outcome, start, errMsg, body, v.Body, usage)
+			rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, http.StatusOK, outcome, start, errMsg, body, v.Body, usage))
 			return
 		case *executor.StreamResult:
 			flusher, ok := w.(http.Flusher)
@@ -649,7 +694,7 @@ func (s *Server) forward(
 				cancelAttempt()
 				s.observeAttempt(reqID, attempt, resolveName, key, lease, http.StatusInternalServerError, pool.OutcomeRequestError, attemptStart, time.Time{})
 				writeAPIError(w, http.StatusInternalServerError, "server_error", "streaming not supported")
-				s.logReq(reqID, r, protocol, model, key.Provider, key.Name, http.StatusInternalServerError, reqlog.OutcomeError, start, "streaming not supported", body, nil)
+				rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, http.StatusInternalServerError, reqlog.OutcomeError, start, "streaming not supported", body, nil))
 				return
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -753,7 +798,7 @@ func (s *Server) forward(
 				}
 				s.observeAttemptWithTokens(reqID, attempt, resolveName, key, lease, v.Status, attemptOutcome, attemptStart, firstByteAt, usage.outputTokens, usage.outputSeen)
 			}
-			s.logReq(reqID, r, protocol, model, key.Provider, key.Name, http.StatusOK, outcome, start, streamErr, body, nil, usage)
+			rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, http.StatusOK, outcome, start, streamErr, body, nil, usage))
 			return
 		default:
 			cancelAttempt()
@@ -770,7 +815,7 @@ func (s *Server) forward(
 		w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
 		msg := fmt.Sprintf("all upstream credentials are cooling down for model %s", availabilityErr.Model)
 		writeAPIError(w, http.StatusTooManyRequests, "rate_limit_error", msg)
-		s.logReq(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, http.StatusTooManyRequests, reqlog.OutcomeError, start, msg, body, nil)
+		rows.emit(s.newLogRecord(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, http.StatusTooManyRequests, reqlog.OutcomeError, start, msg, body, nil))
 		return
 	}
 
@@ -781,7 +826,7 @@ func (s *Server) forward(
 			w.WriteHeader(se.Code)
 			_, _ = w.Write(errBody)
 			if !lastErrLogged {
-				s.logReq(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, se.Code, reqlog.OutcomeError, start, se.Error(), body, errBody)
+				rows.emit(s.newLogRecord(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, se.Code, reqlog.OutcomeError, start, se.Error(), body, errBody))
 			}
 			return
 		}
@@ -792,12 +837,12 @@ func (s *Server) forward(
 		}
 		writeAPIError(w, code, "server_error", msg)
 		if !lastErrLogged {
-			s.logReq(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, code, reqlog.OutcomeError, start, msg, body, nil)
+			rows.emit(s.newLogRecord(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, code, reqlog.OutcomeError, start, msg, body, nil))
 		}
 		return
 	}
 	writeAPIError(w, http.StatusBadGateway, "server_error", "all upstream credentials failed")
-	s.logReq(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, http.StatusBadGateway, reqlog.OutcomeError, start, "all upstream credentials failed", body, nil)
+	rows.emit(s.newLogRecord(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, http.StatusBadGateway, reqlog.OutcomeError, start, "all upstream credentials failed", body, nil))
 }
 
 // handleImages proxies OpenAI Images API requests (/v1/images/generations,

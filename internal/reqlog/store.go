@@ -32,9 +32,12 @@ type Record struct {
 	OutputTokens  int64     `json:"output_tokens"`
 	CachedTokens  int64     `json:"cached_tokens"`
 	UsageComplete bool      `json:"usage_complete"`
-	Error         string    `json:"error"`
-	ReqBody       string    `json:"req_body,omitempty"`
-	RespBody      string    `json:"resp_body,omitempty"`
+	// Retried marks a failed attempt that a later row of the same request
+	// superseded; usage stats count only the final row of each request.
+	Retried  bool   `json:"retried"`
+	Error    string `json:"error"`
+	ReqBody  string `json:"req_body,omitempty"`
+	RespBody string `json:"resp_body,omitempty"`
 }
 
 func normalizeRecord(r Record) Record {
@@ -51,11 +54,18 @@ func normalizeRecord(r Record) Record {
 
 // Store persists request records and supports retention cleanup and monitor queries.
 type Store interface {
+	// Insert writes the row and folds it into usage_hourly in one transaction.
 	Insert(ctx context.Context, r Record) error
+	// Clear deletes raw rows only; the hourly usage rollup is kept.
 	Clear(ctx context.Context) (int64, error)
 	DeleteOlderThan(ctx context.Context, cutoff time.Time) (int64, error)
+	// StripBodies clears bodies of rows with after <= ts < before; a zero
+	// after means no lower bound.
+	StripBodies(ctx context.Context, after, before time.Time) (int64, error)
 	List(ctx context.Context, f ListFilter) ([]Record, int64, error)
 	Stats(ctx context.Context, f ListFilter) (Stats, error)
+	// Usage returns hourly rollup buckets with from <= hour < to.
+	Usage(ctx context.Context, from, to time.Time) ([]UsageBucket, error)
 	Close() error
 }
 
@@ -65,8 +75,14 @@ type Noop struct{}
 func (Noop) Insert(context.Context, Record) error                      { return nil }
 func (Noop) Clear(context.Context) (int64, error)                      { return 0, nil }
 func (Noop) DeleteOlderThan(context.Context, time.Time) (int64, error) { return 0, nil }
+func (Noop) StripBodies(context.Context, time.Time, time.Time) (int64, error) {
+	return 0, nil
+}
 func (Noop) List(context.Context, ListFilter) ([]Record, int64, error) {
 	return []Record{}, 0, nil
 }
 func (Noop) Stats(context.Context, ListFilter) (Stats, error) { return emptyStats(), nil }
-func (Noop) Close() error                                     { return nil }
+func (Noop) Usage(context.Context, time.Time, time.Time) ([]UsageBucket, error) {
+	return []UsageBucket{}, nil
+}
+func (Noop) Close() error { return nil }

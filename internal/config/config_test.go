@@ -244,3 +244,33 @@ openai-responses:
 		t.Fatalf("validate invalid verbosity = %v, want verbosity validation error", err)
 	}
 }
+
+func TestRequestLogRetentionDefaults(t *testing.T) {
+	raw := `
+port: 1
+api-keys: [k]
+request-log:
+  enabled: true
+openai-completions:
+  - name: x
+    base-url: http://x
+    api-key: a
+    models: [{name: m}]
+`
+	var cfg Config
+	if err := yaml.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.applyDefaults()
+	if err := cfg.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RequestLog.Retention != "0s" || cfg.RequestLog.BodyRetention != "168h" {
+		t.Fatalf("retention=%q body-retention=%q want 0s/168h", cfg.RequestLog.Retention, cfg.RequestLog.BodyRetention)
+	}
+
+	cfg.RequestLog.BodyRetention = "7d"
+	if err := cfg.validate(); err == nil {
+		t.Fatal("body-retention 7d should be rejected (not a Go duration)")
+	}
+}

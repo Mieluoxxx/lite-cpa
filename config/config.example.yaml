@@ -39,8 +39,9 @@ channel-affinity: [claude, gpt, gemini, grok, glm, kimi, qwen, minimax]
 request-log:
   enabled: false
   backend: "sqlite"          # sqlite | postgres
-  retention: "168h"
+  retention: "0s"            # rows: "0s" keeps forever / 行保留期，0s = 永久
   store-body: false
+  body-retention: "168h"     # with store-body: clear bodies after this, keep the row / 正文保留期
   sqlite:
     path: "logs/requests.db"
   # postgres:

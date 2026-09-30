@@ -184,8 +184,11 @@ Optional structured log (stderr diagnostics always available).
 |---|---|
 | `enabled` | default false |
 | `backend` | `sqlite` or `postgres` |
-| `retention` | Go duration, e.g. `168h`; hourly cleanup |
+| `retention` | Go duration for whole rows; default `0s` = keep forever; hourly cleanup when > 0 |
 | `store-body` | default false; bodies capped 64KiB; **streams omit response body** |
+| `body-retention` | default `168h`; clears bodies (keeps the row) older than this; only matters with `store-body` |
+
+Rows are per upstream attempt; a failed attempt superseded by a retry is `retried=true` (held in `server.requestLog` until the next attempt starts). `Insert` also upserts `usage_hourly` (UTC hour × user_agent × model) in the same transaction; the rollup is never pruned and survives "clear logs". `GET /api/usage?bucket=day|weekhour&days=&tz=` folds it into the caller's local days for the dashboard.
 | `sqlite.path` | default `logs/requests.db` |
 | `postgres.dsn` | required when backend is postgres |
 
@@ -297,7 +300,7 @@ Runtime reloads the YAML without dropping the listen socket:
 
 **Hot-swapped:** `api-keys`, providers/models/keys/priority/failover, `request-retry`, `channel-affinity`, `debug`, `max-body-bytes`, `request-log.store-body`, global `proxy-url` (via rebuilt keys). These are applied even when the same save also touched an immutable field below.
 
-**Require restart (ignored until restart, logged as a warning):** `host`, `port`, and request-log `enabled` / `backend` / sqlite path / postgres DSN / `retention` (logger is opened once at boot). Drift here does **not** abort the reload — the previous values stay active and every reloadable field in the same save still takes effect; the warning re-fires on each reload until the process is restarted.
+**Require restart (ignored until restart, logged as a warning):** `host`, `port`, and request-log `enabled` / `backend` / sqlite path / postgres DSN / `retention` / `body-retention` (logger is opened once at boot). Drift here does **not** abort the reload — the previous values stay active and every reloadable field in the same save still takes effect; the warning re-fires on each reload until the process is restarted.
 
 Invalid YAML or validation errors keep the previous config entirely and log `config reload: ... (keeping previous config)`.
 
@@ -320,7 +323,7 @@ docker compose down
 
 - Image: multi-stage `golang:1.26-alpine` → `alpine:3.23`, non-root user `lite` (uid 10001).
 - Env: `TZ=Asia/Shanghai` (override as needed).
-- Config hot-reload: edit `config/config.yaml` in place (or `kill -HUP <pid>`). Providers / keys / models / affinity / `api-keys` / `request-retry` / `debug` / `max-body-bytes` apply without restart. `host`/`port` and request-log enable/backend/path/dsn/retention are ignored until restart (logged as a warning; the rest of that save still applies).
+- Config hot-reload: edit `config/config.yaml` in place (or `kill -HUP <pid>`). Providers / keys / models / affinity / `api-keys` / `request-retry` / `debug` / `max-body-bytes` apply without restart. `host`/`port` and request-log enable/backend/path/dsn/retention/body-retention are ignored until restart (logged as a warning; the rest of that save still applies).
 #### Optional Postgres for request-log
 
 1. Uncomment the `postgres` service in `docker-compose.yml`.
@@ -331,7 +334,7 @@ docker compose down
 request-log:
   enabled: true
   backend: postgres
-  retention: "168h"
+  retention: "0s"
   store-body: false
   postgres:
     dsn: "postgres://litecpa:litecpa@postgres:5432/litecpa?sslmode=disable"

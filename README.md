@@ -94,8 +94,9 @@ debug: false
 request-log:
   enabled: false
   backend: "sqlite"       # sqlite | postgres
-  retention: "168h"       # Go duration; hourly cleanup
+  retention: "0s"         # rows kept forever; set e.g. "720h" to delete old rows hourly
   store-body: false       # metadata only by default; streams never store resp body
+  body-retention: "168h"  # with store-body: clear bodies after 7 days, keep the row
   sqlite:
     path: "logs/requests.db"
   # postgres:
@@ -243,8 +244,11 @@ The default `routing.strategy: priority` preserves the existing provider/key ord
 |---|---|
 | `enabled` | default `false` |
 | `backend` | `sqlite` or `postgres` |
-| `retention` | Go duration, e.g. `168h` (7 days). Cleaned hourly. |
+| `retention` | Go duration for whole rows. Default `0s` = keep forever; e.g. `720h` deletes older rows hourly. |
 | `store-body` | default `false`; if true, bodies capped at 64KiB; **SSE response bodies are not stored** |
+| `body-retention` | Go duration, default `168h`. Clears stored bodies older than this but keeps the row; only matters with `store-body: true`. `0s` never clears. |
+
+Each request writes one row per upstream attempt; a failed attempt that was retried on another key is flagged `retried`. Every row is also folded into an hourly rollup (`usage_hourly`: hour × User-Agent × model) that `retention` and "clear logs" never delete; the dashboard's heatmap and per-agent stats read from it via `GET /api/usage`. Metadata rows take roughly 200–250 bytes each in SQLite.
 | `sqlite.path` | default `logs/requests.db` |
 | `postgres.dsn` | required when backend is postgres |
 
@@ -277,7 +281,7 @@ Listens on port `8317`. Default timezone `Asia/Shanghai` (`TZ`).
 request-log:
   enabled: true
   backend: postgres
-  retention: "168h"
+  retention: "0s"
   store-body: false
   postgres:
     dsn: "postgres://litecpa:litecpa@postgres:5432/litecpa?sslmode=disable"

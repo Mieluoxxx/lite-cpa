@@ -3,6 +3,7 @@ package reqlog
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // buildListWhere builds a WHERE clause and args.
@@ -40,6 +41,34 @@ func buildListWhere(f ListFilter, postgres bool) (string, []any) {
 	}
 	if f.ErrorsOnly {
 		parts = append(parts, `outcome = 'error'`)
+	}
+	tsArg := func(t time.Time) any {
+		if postgres {
+			return t.UTC()
+		}
+		return t.UTC().UnixNano()
+	}
+	if !f.From.IsZero() {
+		add("ts >= $%d", tsArg(f.From))
+	}
+	if !f.To.IsZero() {
+		add("ts < $%d", tsArg(f.To))
+	}
+	if f.UserAgents != nil {
+		if len(f.UserAgents) == 0 {
+			parts = append(parts, "1 = 0")
+		} else {
+			marks := make([]string, len(f.UserAgents))
+			for i, ua := range f.UserAgents {
+				args = append(args, ua)
+				if postgres {
+					marks[i] = fmt.Sprintf("$%d", len(args))
+				} else {
+					marks[i] = "?"
+				}
+			}
+			parts = append(parts, "user_agent IN ("+strings.Join(marks, ", ")+")")
+		}
 	}
 	if len(parts) == 0 {
 		return "", nil
