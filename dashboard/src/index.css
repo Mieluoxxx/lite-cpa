@@ -305,13 +305,6 @@ body {
   min-width: 320px;
 }
 
-h1,
-h2,
-h3,
-p {
-  margin: 0;
-}
-
 :root {
   color-scheme: light;
 }
@@ -343,6 +336,46 @@ p {
   --glass-divider: rgba(255, 255, 255, 0.09);
   --glass-shadow: 0 20px 58px -32px rgba(0, 0, 0, 0.7), 0 1px 1px rgba(255, 255, 255, 0.03) inset;
   --glass-shadow-raised: 0 30px 86px -40px rgba(0, 0, 0, 0.82), 0 1px 1px rgba(255, 255, 255, 0.05) inset;
+}
+
+/* Chart palettes were validated (lightness band, CVD separation, contrast)
+   against the glass card surfaces: ~#f8f9fb light, ~#10151d dark. Keep the
+   agent slot order when editing; it is what makes neighbours distinguishable. */
+:root {
+  --agent-1: #2a78d6;
+  --agent-2: #eb6834;
+  --agent-3: #1baf7a;
+  --agent-4: #eda100;
+  --agent-5: #e87ba4;
+  --agent-6: #008300;
+  --agent-7: #4a3aa7;
+  --agent-other: #898781;
+  --heat-0: rgba(15, 23, 42, 0.07);
+  --heat-1: #5cc275;
+  --heat-2: #35a352;
+  --heat-3: #23803e;
+  --heat-4: #16582b;
+  --mix-cached: #94a3b8;
+  --mix-input: #475569;
+  --mix-output: #0f172a;
+}
+
+.dark {
+  --agent-1: #3987e5;
+  --agent-2: #d95926;
+  --agent-3: #199e70;
+  --agent-4: #c98500;
+  --agent-5: #d55181;
+  --agent-6: #008300;
+  --agent-7: #9085e9;
+  --heat-0: rgba(255, 255, 255, 0.07);
+  --heat-1: #1b6b3a;
+  --heat-2: #23954a;
+  --heat-3: #2ebd57;
+  --heat-4: #5fe07a;
+  --mix-cached: #475569;
+  --mix-input: #94a3b8;
+  --mix-output: #e2e8f0;
 }
 
 body {
