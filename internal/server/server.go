@@ -381,6 +381,21 @@ func writeAPIError(w http.ResponseWriter, status int, typ, msg string) {
 	})
 }
 
+// normalizeErrorBody re-wraps a flat upstream error object under "error".
+// OpenAI/Anthropic SDK clients only read body.error; some upstreams return
+// {"object":"error","message":...} at the top level, which clients then render
+// as "<status> status code (no body)". Every other shape passes through as is.
+// The wrap is byte-wise on purpose: decoding and re-encoding the body would send
+// large integers through float64 and change them.
+func normalizeErrorBody(body string) []byte {
+	raw := []byte(body)
+	msg := gjson.Get(body, "message")
+	if !json.Valid(raw) || !msg.Exists() || msg.Type != gjson.String || gjson.Get(body, "error").Exists() {
+		return raw
+	}
+	return append(append([]byte(`{"error":`), raw...), '}')
+}
+
 func (s *Server) currentCfg() *config.Config {
 	s.cfgMu.RLock()
 	cfg := s.cfg
@@ -575,10 +590,11 @@ func (s *Server) forward(
 					continue
 				}
 				s.observeAttempt(reqID, attempt, resolveName, key, lease, se.Code, pool.OutcomeRequestError, attemptStart, time.Time{})
+				errBody := normalizeErrorBody(se.Body)
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(se.Code)
-				_, _ = w.Write([]byte(se.Body))
-				s.logReq(reqID, r, protocol, model, key.Provider, key.Name, se.Code, reqlog.OutcomeError, start, se.Error(), body, []byte(se.Body))
+				_, _ = w.Write(errBody)
+				s.logReq(reqID, r, protocol, model, key.Provider, key.Name, se.Code, reqlog.OutcomeError, start, se.Error(), body, errBody)
 				return
 			}
 			clearAffinity(key.ID)
@@ -760,11 +776,12 @@ func (s *Server) forward(
 
 	if lastErr != nil {
 		if se, ok := lastErr.(executor.StatusError); ok {
+			errBody := normalizeErrorBody(se.Body)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(se.Code)
-			_, _ = w.Write([]byte(se.Body))
+			_, _ = w.Write(errBody)
 			if !lastErrLogged {
-				s.logReq(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, se.Code, reqlog.OutcomeError, start, se.Error(), body, []byte(se.Body))
+				s.logReq(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, se.Code, reqlog.OutcomeError, start, se.Error(), body, errBody)
 			}
 			return
 		}
