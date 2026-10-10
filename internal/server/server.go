@@ -248,10 +248,29 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, source tran
 		resolveName = baseModel
 	}
 
+	losses := translator.NewLossRecorder()
 	s.forward(w, r, reqID, protocol, model, resolveName, body, start,
 		func(ctx context.Context, key registry.UpstreamKey, upstreamModel string) (any, error) {
-			return executor.Execute(ctx, key, upstreamModel, source, body, stream)
+			return executor.Execute(translator.WithLossRecorder(ctx, losses), key, upstreamModel, source, body, stream)
 		})
+	s.logConversionLoss(reqID, source, losses)
+}
+
+// logConversionLoss reports what the conversion to the upstream protocol could
+// not carry. The client never sees it, so stderr is the only place it shows up:
+// one summary line per request, plus per-field detail when debug is on.
+func (s *Server) logConversionLoss(reqID string, source translator.Format, losses *translator.LossRecorder) {
+	diags := losses.Diagnostics()
+	if len(diags) == 0 {
+		return
+	}
+	log.Printf("conversion loss req=%s from=%s %s", reqID, source, losses.Summary())
+	if !s.debugEnabled() {
+		return
+	}
+	for _, diag := range diags {
+		log.Printf("conversion loss req=%s severity=%s code=%s path=%s %s", reqID, diag.Severity, diag.Code, diag.Path, diag.Message)
+	}
 }
 
 func (s *Server) logReq(id string, r *http.Request, protocol, model, provider, upstream string, status int, outcome string, start time.Time, errMsg string, reqBody, respBody []byte, usage ...tokenUsage) {

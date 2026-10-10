@@ -120,6 +120,9 @@ func Execute(ctx context.Context, key registry.UpstreamKey, upstreamModel string
 
 	translated := translator.TranslateRequest(from, to, baseModel, payload, stream)
 	translated, _ = sjson.SetBytes(translated, "model", baseModel)
+	// Report what the conversion dropped. Inert unless the caller armed a
+	// recorder on ctx.
+	translator.RecordLosses(ctx, from, to, payload, translated)
 	translated, err := thinking.ApplyThinking(translated, upstreamModel, from.String(), to.String(), key.Provider)
 	if err != nil {
 		return nil, err
