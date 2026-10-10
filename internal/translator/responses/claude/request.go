@@ -121,6 +121,14 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		out, _ = sjson.SetBytes(out, "max_tokens", mot.Int())
 	}
 
+	// Sampling controls carry over unchanged.
+	if temperature := root.Get("temperature"); temperature.Exists() && temperature.Type != gjson.Null {
+		out, _ = sjson.SetBytes(out, "temperature", temperature.Float())
+	}
+	if topP := root.Get("top_p"); topP.Exists() && topP.Type != gjson.Null {
+		out, _ = sjson.SetBytes(out, "top_p", topP.Float())
+	}
+
 	// Stream
 	out, _ = sjson.SetBytes(out, "stream", stream)
 

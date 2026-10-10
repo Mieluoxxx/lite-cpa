@@ -48,6 +48,14 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		out, _ = sjson.SetBytes(out, "parallel_tool_calls", parallelToolCalls.Bool())
 	}
 
+	// Sampling controls carry over unchanged.
+	if temperature := root.Get("temperature"); temperature.Exists() && temperature.Type != gjson.Null {
+		out, _ = sjson.SetBytes(out, "temperature", temperature.Float())
+	}
+	if topP := root.Get("top_p"); topP.Exists() && topP.Type != gjson.Null {
+		out, _ = sjson.SetBytes(out, "top_p", topP.Float())
+	}
+
 	// Convert instructions to system message
 	if instructions := root.Get("instructions"); instructions.Exists() {
 		systemMessage := []byte(`{"role":"system","content":""}`)

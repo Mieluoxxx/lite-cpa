@@ -20,10 +20,10 @@ func ConvertOpenAIChatCompletionsRequestToOpenAIResponses(modelName string, inpu
 	if maxTokens := root.Get("max_completion_tokens"); maxTokens.Exists() {
 		out, _ = sjson.SetBytes(out, "max_output_tokens", maxTokens.Int())
 	}
-	if temp := root.Get("temperature"); temp.Exists() {
+	if temp := root.Get("temperature"); temp.Exists() && temp.Type != gjson.Null {
 		out, _ = sjson.SetBytes(out, "temperature", temp.Float())
 	}
-	if topP := root.Get("top_p"); topP.Exists() {
+	if topP := root.Get("top_p"); topP.Exists() && topP.Type != gjson.Null {
 		out, _ = sjson.SetBytes(out, "top_p", topP.Float())
 	}
 	if ptc := root.Get("parallel_tool_calls"); ptc.Exists() {

@@ -159,3 +159,45 @@ func TestResponsesToChatStreamToolCallItemID(t *testing.T) {
 		t.Fatalf("finish_reason: got %q want tool_calls", finish)
 	}
 }
+
+// TestSamplingControlsSurviveCrossProtocolConversion pins that temperature and
+// top_p reach every upstream body. The Responses sources never read them, and
+// the Chat/Claude pair forwarded top_p only when temperature was absent.
+func TestSamplingControlsSurviveCrossProtocolConversion(t *testing.T) {
+	translator.RegisterBuiltin()
+	sources := map[translator.Format]string{
+		translator.FormatOpenAI:         `{"model":"m","messages":[{"role":"user","content":"hi"}],"temperature":0.7,"top_p":0.3}`,
+		translator.FormatOpenAIResponse: `{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"temperature":0.7,"top_p":0.3}`,
+		translator.FormatClaude:         `{"model":"m","max_tokens":100,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"temperature":0.7,"top_p":0.3}`,
+	}
+	for from, body := range sources {
+		for _, to := range []translator.Format{translator.FormatOpenAI, translator.FormatOpenAIResponse, translator.FormatClaude} {
+			if from == to {
+				continue
+			}
+			out := translator.TranslateRequest(from, to, "m", []byte(body), false)
+			if got := gjson.GetBytes(out, "temperature").Float(); got != 0.7 {
+				t.Errorf("%s to %s: temperature = %v, want 0.7; body %s", from, to, got, out)
+			}
+			if got := gjson.GetBytes(out, "top_p").Float(); got != 0.3 {
+				t.Errorf("%s to %s: top_p = %v, want 0.3; body %s", from, to, got, out)
+			}
+		}
+	}
+}
+
+// TestNullSamplingControlsAreNotForwarded guards the gjson Exists trap: an
+// explicit null exists, but turning it into temperature 0 changes sampling.
+func TestNullSamplingControlsAreNotForwarded(t *testing.T) {
+	translator.RegisterBuiltin()
+	for _, to := range []translator.Format{translator.FormatOpenAIResponse, translator.FormatClaude} {
+		out := translator.TranslateRequest(translator.FormatOpenAI, to, "m",
+			[]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}],"temperature":null,"top_p":null}`), false)
+		if gjson.GetBytes(out, "temperature").Exists() {
+			t.Errorf("chat to %s forwarded a null temperature: %s", to, out)
+		}
+		if gjson.GetBytes(out, "top_p").Exists() {
+			t.Errorf("chat to %s forwarded a null top_p: %s", to, out)
+		}
+	}
+}
