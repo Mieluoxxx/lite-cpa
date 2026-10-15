@@ -452,6 +452,13 @@ func doClaude(ctx context.Context, key registry.UpstreamKey, url string, body []
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 		req.Header.Set("Cache-Control", "no-cache")
+		// Identity on purpose, not an oversight: Go's automatic gzip decoding
+		// only emits data once a complete deflate block arrives, so an upstream
+		// that compresses without flushing per event would batch the SSE events
+		// and destroy incrementality. Setting Accept-Encoding by hand also
+		// disables the transport's transparent decompression, so a provider
+		// header overriding this to gzip/br/zstd would hand us an unreadable
+		// body (config refuses that).
 		req.Header.Set("Accept-Encoding", "identity")
 	}
 	applyCustomHeaders(req, key.Headers)

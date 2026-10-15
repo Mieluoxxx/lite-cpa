@@ -22,6 +22,21 @@ api-keys:
 request-retry: 2
 debug: false
 
+# gzip response compression for clients that send Accept-Encoding: gzip
+# (default on; a client that sends no Accept-Encoding is never compressed).
+# 下游 gzip 响应压缩（默认开启；未声明 Accept-Encoding 的客户端不受影响）。
+# compression: true
+
+# Protocol-native keepalive frames for silent streams: a first frame after
+# first-frame-wait, then one per idle interval. Enabled by default; on already
+# committed streams a late upstream failure is reported in-band (AGENTS.md).
+# 流式静默期保活帧（默认开启；已提交 200 的流，晚到错误改为协议内错误事件）。
+sse-keepalive: true
+# sse-keepalive:
+#   enabled: true
+#   first-frame-wait: 2s
+#   interval: 15s
+
 # Affinity on by default (TTL 600s, skip-retry false). Details in AGENTS.md.
 # 亲和默认开启（TTL 600s，失败可换 key）。详见 AGENTS.md。
 channel-affinity: [claude, gpt, gemini, grok, glm, kimi, qwen, minimax]

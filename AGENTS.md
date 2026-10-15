@@ -61,6 +61,8 @@ Copy `config/config.example.yaml` → `config/config.yaml`. **At least one** of 
 | `api-keys` | **required** | Gateway auth keys (Bearer / `x-api-key`). Not upstream keys. |
 | `request-retry` | `0` if unset (example uses `2`) | Extra attempts after first failure; total tries ≤ number of keys for that model |
 | `debug` | `false` | Verbose stderr |
+| `compression` | on | gzip response compression for clients that send `Accept-Encoding: gzip` |
+| `sse-keepalive` | on | Protocol-native keepalive frames during upstream silence on streams |
 | `max-body-bytes` | `32MiB` | Inbound body limit |
 | `proxy-url` | empty | Global outbound proxy fallback if provider has none |
 | `channel-affinity` | on by default | See [Channel affinity](#channel-affinity) |
@@ -169,6 +171,34 @@ channel-affinity:
 **Model family match:** substring, case-insensitive (e.g. `proxy-claude-x` matches `claude`).
 
 Advanced: set `rules:` to fully override generated family rules (see `internal/config` types). Empty `rules` with enabled affinity expands from `models` / defaults.
+
+### Compression and stream keepalive
+
+Both are on by default and both are transparent to clients that do not opt in.
+
+**Response compression (`compression`).** A response is gzipped only when the client sent an `Accept-Encoding` that accepts gzip (`gzip;q=0` and `*;q=0` are honoured). Compressed responses carry `Content-Encoding: gzip` and `Vary: Accept-Encoding`, and drop any `Content-Length`. Only compressible types are touched (`text/*`, `application/json`, `+json`, `application/javascript`, `application/xml`, `image/svg+xml`); images and binary passthrough are not. Range responses (206) and already-encoded bodies are left alone. Streams stay incremental: each handler flush pushes one complete gzip block and then the connection, so `curl -N --compressed` still sees events arrive one at a time. Set `compression: false` to disable.
+
+**Request body decompression.** A client may send `Content-Encoding: gzip`, `deflate` or `zstd` (multipart uploads are exempt). The body is unwrapped before affinity extraction, translation and request logging see it. `max-body-bytes` caps the bytes the client actually sent; the decompressed stream gets a second cap of the same size, so an over-limit body fails the read instead of expanding without bound, and the zstd decoder additionally refuses a frame whose declared window would allocate more than 64MiB. `br` is rejected with `415`.
+
+**Stream keepalive (`sse-keepalive`).** For requests that asked for `stream: true`, the gateway emits protocol-native frames while the upstream is silent — first after `first-frame-wait` (default 2s), then once per `interval` (default 15s) of continued silence. Any real upstream data resets the timer, and the frames stop once a terminal event (`response.completed`, `response.failed`, `response.incomplete`, `message_stop`, `[DONE]`) has been forwarded.
+
+| Client protocol | Frame |
+|---|---|
+| `/v1/responses` | `data: {"type":"response.in_progress"}` |
+| `/v1/chat/completions` | `: keepalive` (SSE comment, invisible to data parsers) |
+| `/v1/messages` | `event: ping` + `data: {"type":"ping"}` |
+
+```yaml
+sse-keepalive: true            # or false
+sse-keepalive:
+  enabled: true
+  first-frame-wait: 2s
+  interval: 15s
+```
+
+**Semantic boundary.** The executor blocks until the upstream's first SSE event, so without a keepalive the client would see no bytes at all until then. Once the first-frame wait elapses the gateway commits `200` + `text/event-stream` itself and reports a failure that arrives afterwards **in-band** as a protocol-shaped error event instead of an HTTP status. A failure that arrives before the wait (the common relay case, e.g. a fast `429`) still returns its real status code, and internal key failover continues either way. Set `sse-keepalive: false` to keep status-only error semantics for streams. Non-stream requests are never affected.
+
+**Upstream encoding.** `Accept-Encoding` is not configurable per provider: setting it by hand disables Go's transparent gzip decoding, and forcing `gzip` on a stream would let an upstream that compresses without flushing per event batch the events and destroy incrementality. Streaming Claude requests pin `identity` for that reason; other requests use the transport default (auto `gzip` + transparent decode). Config validation rejects a provider `headers` entry that sets `Accept-Encoding` to anything but `identity`.
 
 ### Adaptive routing
 
@@ -298,7 +328,7 @@ Runtime reloads the YAML without dropping the listen socket:
 - **File mtime poll** every ~1s (debounced 300ms) — works with Docker bind mounts and editor temp+rename saves
 - **`SIGHUP`** — `kill -HUP $(pidof lite-cpa)`
 
-**Hot-swapped:** `api-keys`, providers/models/keys/priority/failover, `request-retry`, `channel-affinity`, `debug`, `max-body-bytes`, `request-log.store-body`, global `proxy-url` (via rebuilt keys). These are applied even when the same save also touched an immutable field below.
+**Hot-swapped:** `api-keys`, providers/models/keys/priority/failover, `request-retry`, `channel-affinity`, `debug`, `compression`, `sse-keepalive`, `max-body-bytes`, `request-log.store-body`, global `proxy-url` (via rebuilt keys). These are applied even when the same save also touched an immutable field below.
 
 **Require restart (ignored until restart, logged as a warning):** `host`, `port`, and request-log `enabled` / `backend` / sqlite path / postgres DSN / `retention` / `body-retention` (logger is opened once at boot). Drift here does **not** abort the reload — the previous values stay active and every reloadable field in the same save still takes effect; the warning re-fires on each reload until the process is restarted.
 

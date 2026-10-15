@@ -31,12 +31,20 @@ type Config struct {
 	// RequestLog is optional request recording (sqlite or postgres) with retention.
 	RequestLog RequestLogConfig `yaml:"request-log"`
 
+	// Compression enables gzip response compression for clients that advertise
+	// Accept-Encoding: gzip. Unset (nil) means enabled; a client that sends no
+	// Accept-Encoding always receives an uncompressed response.
+	Compression *bool `yaml:"compression"`
+
 	// ChannelAffinity pins successful upstream keys by request affinity keys
 	// (new-api style rule stickiness; process-local memory cache).
 	ChannelAffinity ChannelAffinitySetting `yaml:"channel-affinity"`
 
 	// Routing controls optional same-priority adaptive key selection.
 	Routing RoutingConfig `yaml:"routing"`
+
+	// SSEKeepalive injects protocol-native keepalive frames into silent streams.
+	SSEKeepalive SSEKeepaliveConfig `yaml:"sse-keepalive"`
 
 	AnthropicMessages []Provider `yaml:"anthropic-messages"`
 	OpenAIResponses   []Provider `yaml:"openai-responses"`
@@ -58,6 +66,12 @@ func (r RoutingConfig) HalfLifeDuration() time.Duration {
 		return 72 * time.Hour
 	}
 	return d
+}
+
+// CompressionEnabled returns true unless response compression was explicitly
+// disabled. Clients that send no Accept-Encoding are never compressed.
+func (c Config) CompressionEnabled() bool {
+	return c.Compression == nil || *c.Compression
 }
 
 // ChannelAffinityKeySource extracts a sticky identity from the request.
@@ -193,6 +207,84 @@ func (s ChannelAffinitySetting) ResolvedRules() []ChannelAffinityRule {
 		models = DefaultChannelAffinityModels()
 	}
 	return ExpandAffinityModels(models)
+}
+
+// SSEKeepaliveConfig keeps a streaming response body alive while the upstream
+// is silent (long reasoning, slow first token), where an idle body would
+// otherwise trip a client or intermediary timeout. Enabled by default.
+//
+// YAML accepts `sse-keepalive: true|false` or a mapping:
+//
+//	sse-keepalive:
+//	  enabled: true
+//	  first-frame-wait: 2s
+//	  interval: 15s
+type SSEKeepaliveConfig struct {
+	Enabled        *bool  `yaml:"enabled"`
+	FirstFrameWait string `yaml:"first-frame-wait,omitempty"`
+	Interval       string `yaml:"interval,omitempty"`
+}
+
+const (
+	defaultSSEKeepaliveFirstFrameWait = 2 * time.Second
+	defaultSSEKeepaliveInterval       = 15 * time.Second
+)
+
+// UnmarshalYAML accepts bool | mapping.
+func (s *SSEKeepaliveConfig) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.ScalarNode:
+		var enabled bool
+		if err := value.Decode(&enabled); err != nil {
+			return fmt.Errorf("sse-keepalive: expected bool or mapping")
+		}
+		s.Enabled = &enabled
+		return nil
+	case yaml.MappingNode:
+		type raw struct {
+			Enabled        *bool  `yaml:"enabled"`
+			FirstFrameWait string `yaml:"first-frame-wait"`
+			Interval       string `yaml:"interval"`
+		}
+		var r raw
+		if err := value.Decode(&r); err != nil {
+			return err
+		}
+		s.Enabled = r.Enabled
+		s.FirstFrameWait = r.FirstFrameWait
+		s.Interval = r.Interval
+		return nil
+	case yaml.DocumentNode:
+		if len(value.Content) == 1 {
+			return s.UnmarshalYAML(value.Content[0])
+		}
+	}
+	return fmt.Errorf("sse-keepalive: unsupported yaml node")
+}
+
+// EnabledOrDefault returns true unless explicitly disabled.
+func (s SSEKeepaliveConfig) EnabledOrDefault() bool {
+	if s.Enabled == nil {
+		return true
+	}
+	return *s.Enabled
+}
+
+// FirstFrameWaitDuration is the wait before the first keepalive frame.
+func (s SSEKeepaliveConfig) FirstFrameWaitDuration() time.Duration {
+	return positiveDuration(s.FirstFrameWait, defaultSSEKeepaliveFirstFrameWait)
+}
+
+// IntervalDuration is the idle gap between later keepalive frames.
+func (s SSEKeepaliveConfig) IntervalDuration() time.Duration {
+	return positiveDuration(s.Interval, defaultSSEKeepaliveInterval)
+}
+
+func positiveDuration(value string, fallback time.Duration) time.Duration {
+	if d, err := time.ParseDuration(strings.TrimSpace(value)); err == nil && d > 0 {
+		return d
+	}
+	return fallback
 }
 
 // RequestLogConfig controls optional request recording.
@@ -450,6 +542,17 @@ func (c *Config) validate() error {
 	if halfLife, err := time.ParseDuration(halfLifeValue); err != nil || halfLife <= 0 {
 		return fmt.Errorf("routing.half-life must be a positive Go duration, got %q", c.Routing.HalfLife)
 	}
+	for name, value := range map[string]string{
+		"first-frame-wait": c.SSEKeepalive.FirstFrameWait,
+		"interval":         c.SSEKeepalive.Interval,
+	} {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		if d, err := time.ParseDuration(value); err != nil || d <= 0 {
+			return fmt.Errorf("sse-keepalive.%s must be a positive Go duration, got %q", name, value)
+		}
+	}
 	for _, group := range [][]Provider{c.AnthropicMessages, c.OpenAIResponses, c.OpenAICompletions} {
 		for i, p := range group {
 			switch NormalizeFailoverMode(p.FailoverMode) {
@@ -467,6 +570,21 @@ func (c *Config) validate() error {
 					name = fmt.Sprintf("#%d", i)
 				}
 				return fmt.Errorf("provider %q speed is no longer supported; move it under models[].speed", name)
+			}
+			// A provider-level Accept-Encoding silently disables the transport's
+			// transparent gzip decoding, so anything but identity would hand the
+			// executor a compressed body it cannot read.
+			for header, value := range p.Headers {
+				if !strings.EqualFold(header, "Accept-Encoding") {
+					continue
+				}
+				if enc := strings.ToLower(strings.TrimSpace(value)); enc != "" && enc != "identity" {
+					name := strings.TrimSpace(p.Name)
+					if name == "" {
+						name = fmt.Sprintf("#%d", i)
+					}
+					return fmt.Errorf("provider %q headers.Accept-Encoding must be identity (or unset), got %q: it would disable transparent decompression", name, value)
+				}
 			}
 			for _, m := range p.Models {
 				name := strings.TrimSpace(p.Name)

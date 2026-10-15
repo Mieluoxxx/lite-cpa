@@ -274,3 +274,89 @@ openai-completions:
 		t.Fatal("body-retention 7d should be rejected (not a Go duration)")
 	}
 }
+
+const baseConfigYAML = "port: 1\napi-keys: [k]\nopenai-completions:\n  - name: x\n    base-url: http://x\n    api-key: a\n    models: [{name: m}]\n"
+
+func loadConfig(t *testing.T, extra string) (Config, error) {
+	t.Helper()
+	var cfg Config
+	if err := yaml.Unmarshal([]byte(baseConfigYAML+extra), &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	cfg.applyDefaults()
+	return cfg, cfg.validate()
+}
+
+func TestSSEKeepaliveYAMLForms(t *testing.T) {
+	cases := []struct {
+		name     string
+		extra    string
+		enabled  bool
+		first    time.Duration
+		interval time.Duration
+	}{
+		{"omitted defaults on", "", true, 2 * time.Second, 15 * time.Second},
+		{"bool true", "sse-keepalive: true\n", true, 2 * time.Second, 15 * time.Second},
+		{"bool false", "sse-keepalive: false\n", false, 2 * time.Second, 15 * time.Second},
+		{"mapping interval", "sse-keepalive:\n  interval: 5s\n", true, 2 * time.Second, 5 * time.Second},
+		{"mapping disabled", "sse-keepalive:\n  enabled: false\n  first-frame-wait: 1s\n", false, time.Second, 15 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := loadConfig(t, tc.extra)
+			if err != nil {
+				t.Fatalf("validate: %v", err)
+			}
+			if got := cfg.SSEKeepalive.EnabledOrDefault(); got != tc.enabled {
+				t.Errorf("enabled = %v, want %v", got, tc.enabled)
+			}
+			if got := cfg.SSEKeepalive.FirstFrameWaitDuration(); got != tc.first {
+				t.Errorf("first-frame-wait = %v, want %v", got, tc.first)
+			}
+			if got := cfg.SSEKeepalive.IntervalDuration(); got != tc.interval {
+				t.Errorf("interval = %v, want %v", got, tc.interval)
+			}
+		})
+	}
+}
+
+func TestSSEKeepaliveRejectsNonPositiveDuration(t *testing.T) {
+	if _, err := loadConfig(t, "sse-keepalive:\n  interval: 0s\n"); err == nil {
+		t.Fatal("interval 0s must be rejected")
+	}
+	if _, err := loadConfig(t, "sse-keepalive:\n  first-frame-wait: soon\n"); err == nil {
+		t.Fatal("first-frame-wait soon must be rejected")
+	}
+}
+
+func TestCompressionDefaultsOn(t *testing.T) {
+	cfg, err := loadConfig(t, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.CompressionEnabled() {
+		t.Fatal("compression must default to enabled")
+	}
+
+	cfg, err = loadConfig(t, "compression: false\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CompressionEnabled() {
+		t.Fatal("compression: false must disable it")
+	}
+}
+
+// A provider-level Accept-Encoding would silently disable the transport's
+// transparent decompression, so config rejects anything but identity.
+func TestProviderAcceptEncodingHeaderGuard(t *testing.T) {
+	for _, value := range []string{"gzip", "gzip, br, zstd", "br"} {
+		_, err := loadConfig(t, "openai-responses:\n  - name: y\n    base-url: http://y\n    api-key: b\n    headers: {Accept-Encoding: '"+value+"'}\n    models: [{name: n}]\n")
+		if err == nil {
+			t.Errorf("Accept-Encoding %q must be rejected", value)
+		}
+	}
+	if _, err := loadConfig(t, "openai-responses:\n  - name: y\n    base-url: http://y\n    api-key: b\n    headers: {Accept-Encoding: identity}\n    models: [{name: n}]\n"); err != nil {
+		t.Fatalf("Accept-Encoding identity must be accepted: %v", err)
+	}
+}

@@ -88,7 +88,7 @@ func New(cfg *config.Config, logger *reqlog.Logger) *Server {
 	mux.HandleFunc("POST /v1/images/edits", func(w http.ResponseWriter, r *http.Request) {
 		s.handleImages(w, r, "edits")
 	})
-	handler := s.auth.Middleware(s.limitBody(withRecover(mux)))
+	handler := s.compress(s.auth.Middleware(s.limitBody(s.decodeBody(withRecover(mux)))))
 	addr := net.JoinHostPort(cfg.Host, fmt.Sprintf("%d", cfg.Port))
 	s.http = &http.Server{
 		Addr:              addr,
@@ -536,6 +536,36 @@ func (s *Server) forward(
 	if aff.Found && !preferredUsable {
 		s.affinity.MarkPreferredUnavailable()
 	}
+
+	// Keepalive spans both halves of a streamed request: the wait for the
+	// upstream's first event (the executor blocks on it before returning) and
+	// every later gap between events. Committing the 200 from here is a
+	// deliberate trade — the client gets bytes instead of silence, and a failure
+	// that shows up afterwards is reported in-band because the status can no
+	// longer change. Only requests that asked for stream: true are affected.
+	var keepalive *streamKeepalive
+	if gjson.GetBytes(body, "stream").Bool() {
+		keepalive = s.newStreamKeepalive(protocol)
+	}
+	if _, ok := w.(http.Flusher); !ok {
+		keepalive = nil
+	}
+	defer keepalive.Stop()
+	committed := false
+	commitStream := func() {
+		if committed {
+			return
+		}
+		committed = true
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+
 	recordAffinity := func(key registry.UpstreamKey) {
 		s.stateMu.RLock()
 		defer s.stateMu.RUnlock()
@@ -623,9 +653,57 @@ func (s *Server) forward(
 			cancel()
 			s.selector.Release(*l)
 		}(leasePtr, cancelAttempt)
-		result, err := execute(attemptCtx, key, upstreamModel)
+
+		// The executor blocks until the upstream's first SSE event, so when
+		// keepalive is armed the call runs in its own goroutine and is raced
+		// against the frame timer; a cancel closes the wait instead of holding the
+		// lease until the upstream decides to answer. Without keepalive (every
+		// non-stream request, and streams with it disabled) the attempt stays on
+		// this goroutine so a panic still unwinds through withRecover.
+		var result any
+		var err error
+		if keepalive == nil {
+			result, err = execute(attemptCtx, key, upstreamModel)
+		} else {
+			done := make(chan attemptOutcome, 1)
+			go func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						done <- attemptOutcome{err: fmt.Errorf("executor panic: %v", rec)}
+					}
+				}()
+				res, execErr := execute(attemptCtx, key, upstreamModel)
+				done <- attemptOutcome{result: res, err: execErr}
+			}()
+		waitAttempt:
+			for {
+				select {
+				case out := <-done:
+					result, err = out.result, out.err
+					break waitAttempt
+				case <-keepalive.C():
+					commitStream()
+					if _, writeErr := w.Write(keepalive.frame); writeErr != nil {
+						result, err = nil, fmt.Errorf("%w: %v", errStreamWriteFailed, writeErr)
+						break waitAttempt
+					}
+					if f, ok := w.(http.Flusher); ok {
+						f.Flush()
+					}
+					keepalive.Reset()
+				case <-attemptCtx.Done():
+					result, err = nil, attemptCtx.Err()
+					break waitAttempt
+				}
+			}
+		}
 		if err != nil {
 			cancelAttempt()
+			if errors.Is(err, errStreamWriteFailed) {
+				s.observeAttempt(reqID, attempt, resolveName, key, lease, 0, pool.OutcomeCanceled, attemptStart, time.Time{})
+				rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, 0, reqlog.OutcomeClientCanceled, attemptStart, err.Error(), body, nil))
+				return
+			}
 			if ctxErr := r.Context().Err(); ctxErr != nil {
 				s.observeAttempt(reqID, attempt, resolveName, key, lease, 0, pool.OutcomeCanceled, attemptStart, time.Time{})
 				rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, 0, reqlog.OutcomeClientCanceled, attemptStart, ctxErr.Error(), body, nil))
@@ -655,9 +733,13 @@ func (s *Server) forward(
 				}
 				s.observeAttempt(reqID, attempt, resolveName, key, lease, se.Code, pool.OutcomeRequestError, attemptStart, time.Time{})
 				errBody := normalizeErrorBody(se.Body)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(se.Code)
-				_, _ = w.Write(errBody)
+				if committed {
+					writeSSEError(w, protocol, streamErrorMessage(errBody, se.Error()))
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(se.Code)
+					_, _ = w.Write(errBody)
+				}
 				rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, se.Code, reqlog.OutcomeError, start, se.Error(), body, errBody))
 				return
 			}
@@ -716,10 +798,7 @@ func (s *Server) forward(
 				rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, http.StatusInternalServerError, reqlog.OutcomeError, start, "streaming not supported", body, nil))
 				return
 			}
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Connection", "keep-alive")
-			w.WriteHeader(http.StatusOK)
+			commitStream()
 			flusher.Flush()
 			var streamErr string
 			clientCanceled := false
@@ -735,6 +814,20 @@ func (s *Server) forward(
 					streamErr = r.Context().Err().Error()
 					cancelAttempt()
 					streamDone = true
+				case <-keepalive.C():
+					// Synthetic frame: the upstream has been silent past the idle
+					// interval. It deliberately does not count as firstByteAt — no
+					// upstream byte arrived.
+					if _, err := w.Write(keepalive.frame); err != nil {
+						clientCanceled = true
+						streamAborted = true
+						streamErr = err.Error()
+						cancelAttempt()
+						streamDone = true
+						continue
+					}
+					flusher.Flush()
+					keepalive.Reset()
 				case chunk, ok := <-v.Chunks:
 					if !ok {
 						streamDone = true
@@ -769,6 +862,8 @@ func (s *Server) forward(
 						continue
 					}
 					flusher.Flush()
+					keepalive.observe(chunk.Payload)
+					keepalive.Reset()
 				}
 			}
 			if ctxErr := r.Context().Err(); ctxErr != nil {
@@ -833,7 +928,11 @@ func (s *Server) forward(
 		}
 		w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
 		msg := fmt.Sprintf("all upstream credentials are cooling down for model %s", availabilityErr.Model)
-		writeAPIError(w, http.StatusTooManyRequests, "rate_limit_error", msg)
+		if committed {
+			writeSSEError(w, protocol, msg)
+		} else {
+			writeAPIError(w, http.StatusTooManyRequests, "rate_limit_error", msg)
+		}
 		rows.emit(s.newLogRecord(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, http.StatusTooManyRequests, reqlog.OutcomeError, start, msg, body, nil))
 		return
 	}
@@ -841,9 +940,13 @@ func (s *Server) forward(
 	if lastErr != nil {
 		if se, ok := lastErr.(executor.StatusError); ok {
 			errBody := normalizeErrorBody(se.Body)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(se.Code)
-			_, _ = w.Write(errBody)
+			if committed {
+				writeSSEError(w, protocol, streamErrorMessage(errBody, se.Error()))
+			} else {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(se.Code)
+				_, _ = w.Write(errBody)
+			}
 			if !lastErrLogged {
 				rows.emit(s.newLogRecord(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, se.Code, reqlog.OutcomeError, start, se.Error(), body, errBody))
 			}
@@ -854,13 +957,21 @@ func (s *Server) forward(
 		if strings.Contains(msg, "model not found") {
 			code = http.StatusNotFound
 		}
-		writeAPIError(w, code, "server_error", msg)
+		if committed {
+			writeSSEError(w, protocol, msg)
+		} else {
+			writeAPIError(w, code, "server_error", msg)
+		}
 		if !lastErrLogged {
 			rows.emit(s.newLogRecord(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, code, reqlog.OutcomeError, start, msg, body, nil))
 		}
 		return
 	}
-	writeAPIError(w, http.StatusBadGateway, "server_error", "all upstream credentials failed")
+	if committed {
+		writeSSEError(w, protocol, "all upstream credentials failed")
+	} else {
+		writeAPIError(w, http.StatusBadGateway, "server_error", "all upstream credentials failed")
+	}
 	rows.emit(s.newLogRecord(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, http.StatusBadGateway, reqlog.OutcomeError, start, "all upstream credentials failed", body, nil))
 }
 

@@ -15,6 +15,9 @@
 - 三协议互转：`chat` ↔ `responses` ↔ `claude`
 - 命名上游 + 多 Key 轮询 / 失败重试
 - 可选 **渠道亲和性**（new-api 式规则粘滞：按 header/body 钉住上游 key）
+- **gzip 响应压缩**（客户端声明 `Accept-Encoding: gzip` 时，含逐事件刷新的 SSE 流）
+- **流式保活帧**（上游静默时注入协议原生帧：Responses `response.in_progress` / Chat `: keepalive` / Messages `event: ping`）
+- 接受 gzip / deflate / zstd 压缩的请求体（含解压后体积上限）
 - 按上游配置 header（含 `User-Agent`）
 - 可选请求记录：SQLite 或 Postgres，带过期清理
 - 支持二进制 / Docker / Compose 部署
@@ -26,6 +29,7 @@
 - English: [Protocol Conversion](docs/Protocol-Conversion.md)
 - [渠道亲和、重试与故障切换](docs/渠道亲和与重试.md)
 - English: [Channel Affinity and Retry](docs/Channel-Affinity-and-Retry.md)
+- [传输效率提升计划](docs/传输效率提升计划.md) — HTTP 压缩 + SSE 保活 + WebSocket 调研与路线图
 - Wiki：https://github.com/Mieluoxxx/lite-cpa/wiki  
   （GitHub 要求先在网页创建第一个 Wiki 页面后，才能用 git 推送 wiki）
 

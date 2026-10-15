@@ -16,6 +16,9 @@ Based on [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) by Lu
 - Named upstream providers with multi-key round-robin and retry
 - Optional **channel affinity** (new-api style sticky keys by header/body rule)
 - Per-provider headers (including `User-Agent`)
+- **gzip response compression** when the client sends `Accept-Encoding: gzip`, including SSE streams that still flush per event
+- **Stream keepalive frames** during upstream silence (Responses `response.in_progress`, Chat `: keepalive`, Messages `event: ping`)
+- Accepts gzip / deflate / zstd compressed request bodies, with a decompressed-size cap
 - Optional request log: SQLite or Postgres with retention cleanup
 - Binary / Docker / Compose deployment
 
@@ -26,6 +29,7 @@ Based on [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) by Lu
 - Chinese design notes: [格式转换是如何实现的](docs/格式转换是如何实现的.md)
 - [Channel affinity, retry, failover](docs/Channel-Affinity-and-Retry.md)
 - Chinese: [渠道亲和与重试](docs/渠道亲和与重试.md)
+- Chinese research/plan: [传输效率提升计划](docs/传输效率提升计划.md) — HTTP compression + SSE keepalive + WebSocket roadmap
 - Wiki: https://github.com/Mieluoxxx/lite-cpa/wiki  
   (GitHub requires creating the first Wiki page in the web UI before git push works.)
 
