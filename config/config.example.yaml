@@ -42,25 +42,14 @@ sse-keepalive: true
 channel-affinity: [claude, gpt, gemini, grok, glm, kimi, qwen, minimax]
 # channel-affinity: false
 
-# Optional same-priority reliability-aware key selection.
-# 可选的同优先级可靠性自适应选 key。
-# Default is priority (historical provider/key order). Use shadow: true to
-# collect reliability data without changing selection.
-# routing:
-#   strategy: priority   # priority | adaptive
-#   half-life: 72h
-#   shadow: false
-
 request-log:
   enabled: false
-  backend: "sqlite"          # sqlite | postgres
+  backend: "sqlite"
   retention: "0s"            # rows: "0s" keeps forever / 行保留期，0s = 永久
   store-body: false
   body-retention: "168h"     # with store-body: clear bodies after this, keep the row / 正文保留期
   sqlite:
     path: "logs/requests.db"
-  # postgres:
-  #   dsn: "postgres://litecpa:litecpa@postgres:5432/litecpa?sslmode=disable"
 
 # --- Provider field order / 字段顺序 ---
 #   name → proxy-url → priority → failover-mode → headers → base-url → api-key → models

@@ -479,7 +479,7 @@ func (s *SQLiteStore) Close() error {
 
 func (s *SQLiteStore) List(ctx context.Context, f ListFilter) ([]Record, int64, error) {
 	f = normalizeListFilter(f)
-	where, args := buildListWhere(f, false)
+	where, args := buildListWhere(f)
 
 	var total int64
 	countQ := `SELECT COUNT(*) FROM request_logs` + where
@@ -519,7 +519,7 @@ FROM request_logs` + where + ` ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`
 
 func (s *SQLiteStore) Stats(ctx context.Context, f ListFilter) (Stats, error) {
 	st := emptyStats()
-	where, args := buildListWhere(f, false)
+	where, args := buildListWhere(f)
 	row := s.db.QueryRowContext(ctx, `
 SELECT COUNT(*),
        COALESCE(SUM(CASE WHEN outcome = 'completed' THEN 1 ELSE 0 END), 0),

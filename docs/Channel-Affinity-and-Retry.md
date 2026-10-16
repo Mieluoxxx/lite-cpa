@@ -254,7 +254,7 @@ configured. Cooldowns honor an
 upstream `Retry-After`. Expired cooldowns use one half-open probe, so concurrent
 requests do not stampede a recovering key.
 
-Adaptive routing is opt-in via `routing.strategy: adaptive`: it ranks only within the same provider and entry-priority tier using decay-weighted Beta reliability. `shadow: true` records recommendations without changing picks; priority order remains the default. Request cancellation and malformed-request errors do not count as upstream health failures. A config reload clears health and affinity state, and in-flight results from the old generation cannot write back.
+This is failure protection only; selection order is always provider priority, then entry priority, then round-robin. Request cancellation and malformed-request errors do not count as upstream health failures. A config reload clears health and affinity state, and in-flight results from the old generation cannot write back.
 `GET /api/routing/stats` returns non-secret key health counters and active
 cooldowns. `last_first_chunk_ms` measures the first client-visible translated
 chunk, not upstream TTFB; omitted `last_output_tokens` means usage was not

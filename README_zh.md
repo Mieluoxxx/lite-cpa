@@ -4,7 +4,7 @@
 
 轻量 Go 网关，在 **OpenAI Chat Completions**、**OpenAI Responses**、**Anthropic Messages** 之间做协议转换。
 
-单二进制 · 配置多 Key · 可选请求记录（SQLite / Postgres）· 无控制面。
+单二进制 · 配置多 Key · 可选请求记录（SQLite）· 无控制面。
 
 基于 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI)（Luis Pater / Router-For.ME）。
 
@@ -19,7 +19,7 @@
 - **流式保活帧**（上游静默时注入协议原生帧：Responses `response.in_progress` / Chat `: keepalive` / Messages `event: ping`）
 - 接受 gzip / deflate / zstd 压缩的请求体（含解压后体积上限）
 - 按上游配置 header（含 `User-Agent`）
-- 可选请求记录：SQLite 或 Postgres，带过期清理
+- 可选请求记录：SQLite，带过期清理
 - 支持二进制 / Docker / Compose 部署
 
 ## 文档
@@ -97,14 +97,12 @@ debug: false
 # 可选请求记录
 request-log:
   enabled: false
-  backend: "sqlite"       # sqlite | postgres
+  backend: "sqlite"
   retention: "0s"         # 行保留期；0s = 永久，如 "720h" 则每小时删除更早的行
   store-body: false       # 默认只记元数据；流式响应不存 body
   body-retention: "168h"  # 开启 store-body 时：7 天后清空正文，保留元数据行
   sqlite:
     path: "logs/requests.db"
-  # postgres:
-  #   dsn: "postgres://litecpa:litecpa@postgres:5432/litecpa?sslmode=disable"
 
 anthropic-messages:
   - name: anthropic-official
@@ -238,23 +236,18 @@ channel-affinity: [claude, gpt, grok]
 
 亲和身份总表：`internal/affinity/cli_sessions.go`。优先级：产品头（`X-Claude-Code-Session-Id`、`x-opencode-session`、`x-session-affinity`）→ Codex/Pi session/thread → `X-Session-Id` → `X-Client-Request-Id` → 协议 body（`/v1/messages` 归一化 `metadata.user_id`；responses/chat 用 `prompt_cache_key`）。详见 [渠道亲和与重试](docs/渠道亲和与重试.md)。无身份 → 普通轮询。
 
-### 自适应路由（可选）
-
-默认 `routing.strategy: priority`，保持原有 provider/key 优先级。设置 `routing.strategy: adaptive` 后，仅在相同 provider priority 与 entry priority 内按时间衰减的 Beta 可靠性期望值择优；亲和和冷却门禁仍优先。`half-life` 默认 `72h`，`shadow: true` 只采集分数并给出推荐、不改变实际选择。无样本 key 使用中性先验和确定性轮询，每 10 次非亲和选择最多做一次同档冷启动探索，不引入随机 Thompson Sampling。
-
 ### 请求记录
 
 | 字段 | 含义 |
 |---|---|
 | `enabled` | 默认 `false` |
-| `backend` | `sqlite` 或 `postgres` |
+| `backend` | `sqlite`（唯一后端） |
 | `retention` | 整行的保留期（Go duration）。默认 `0s` = 永久保留；如 `720h` 则每小时删除更早的行 |
 | `store-body` | 默认 `false`；为 true 时 body 截断 64KiB；**SSE 响应 body 不存储** |
 | `body-retention` | Go duration，默认 `168h`。超过后清空已存储的正文、保留元数据行；仅在 `store-body: true` 时有意义，`0s` 为永不清理 |
 
 每个请求按「上游尝试」逐行记录；失败后改用其它 key 重试的那次尝试会被标记为 `retried`。每一行同时累加进按小时的汇总表（`usage_hourly`：小时 × User-Agent × 模型），它不受 `retention` 和「清除日志」影响；看板的热力图与 Agent 统计通过 `GET /api/usage` 读取它。SQLite 中每行元数据约 200–250 字节。
 | `sqlite.path` | 默认 `logs/requests.db` |
-| `postgres.dsn` | postgres 后端必填 |
 
 进程诊断日志仍只写 **stderr**（不进数据库）。
 
@@ -275,23 +268,6 @@ docker compose down
 - `./logs` → `/app/logs`（启用 sqlite 时）
 
 监听 `8317`。默认时区 `Asia/Shanghai`（`TZ`）。
-
-### Postgres 后端（可选）
-
-1. 在 `docker-compose.yml` 取消注释 `postgres` 服务。
-2. 在 `config/config.yaml` 中设置：
-
-```yaml
-request-log:
-  enabled: true
-  backend: postgres
-  retention: "0s"
-  store-body: false
-  postgres:
-    dsn: "postgres://litecpa:litecpa@postgres:5432/litecpa?sslmode=disable"
-```
-
-3. 取消注释 `lite-cpa` 的 `depends_on`。
 
 ### 普通 docker
 

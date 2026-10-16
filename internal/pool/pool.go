@@ -2,7 +2,6 @@ package pool
 
 import (
 	"fmt"
-	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -114,25 +113,12 @@ func expandProvider(provider, name, baseURL, flatKey, flatProxy string, flatPrio
 }
 
 func keysForModel(keys []registry.UpstreamKey, upstreamModel, speed, verbosity string) []registry.UpstreamKey {
-	// Attach upstream model name into a copy via ID suffix is not needed;
-	// handlers resolve alias separately. Store upstream model in a synthetic header.
 	out := make([]registry.UpstreamKey, len(keys))
 	for i, k := range keys {
 		out[i] = k
+		out[i].UpstreamModel = upstreamModel
 		out[i].Speed = speed
 		out[i].Verbosity = verbosity
-		if out[i].Headers == nil {
-			out[i].Headers = map[string]string{}
-		} else {
-			h := make(map[string]string, len(k.Headers)+1)
-			for kk, vv := range k.Headers {
-				h[kk] = vv
-			}
-			out[i].Headers = h
-		}
-		if upstreamModel != "" {
-			out[i].Headers["x-lite-upstream-model"] = upstreamModel
-		}
 	}
 	return out
 }
@@ -151,28 +137,6 @@ type Selector struct {
 	rr     sync.Map // model -> *uint64
 	retry  int
 	health *HealthState
-}
-
-func providerScore(model, provider string, keys []registry.UpstreamKey, scores map[string]ReliabilityScore) float64 {
-	total := 0.0
-	count := 0
-	minEntry := int(^uint(0) >> 1)
-	for _, key := range keys {
-		if key.Name == provider && key.EntryPriority < minEntry {
-			minEntry = key.EntryPriority
-		}
-	}
-	for _, key := range keys {
-		if key.Name != provider || key.EntryPriority != minEntry {
-			continue
-		}
-		total += scores[makeKeyScope(model, key)].Value
-		count++
-	}
-	if count == 0 {
-		return 0.5
-	}
-	return total / float64(count)
 }
 
 // AvailabilityError reports that every eligible candidate is currently
@@ -244,20 +208,10 @@ func (s *Selector) Pick(model string, tried map[string]struct{}, preferSupplier 
 // candidates; provider priority and entry priority remain the hard ordering
 // rules. A failed half-open probe is never silently replaced by a bypass.
 func (s *Selector) PickWithLease(model string, tried map[string]struct{}, preferSupplier string, skipSuppliers map[string]struct{}) (registry.UpstreamKey, string, Lease, error) {
-	return s.pickWithLease(model, tried, preferSupplier, skipSuppliers, false, 0)
+	return s.pickWithLease(model, tried, preferSupplier, skipSuppliers)
 }
 
-// PickWithLeaseExploring advances the bounded exploration counter once for a
-// non-affinity selection. Retries reuse the same request's normal ordering.
-func (s *Selector) PickWithLeaseExploring(model string, tried map[string]struct{}, preferSupplier string, skipSuppliers map[string]struct{}) (registry.UpstreamKey, string, Lease, error) {
-	explore, index := false, int64(0)
-	if s.health != nil {
-		explore, index = s.health.NextExploration(model)
-	}
-	return s.pickWithLease(model, tried, preferSupplier, skipSuppliers, explore, index)
-}
-
-func (s *Selector) pickWithLease(model string, tried map[string]struct{}, preferSupplier string, skipSuppliers map[string]struct{}, explore bool, exploreIndex int64) (registry.UpstreamKey, string, Lease, error) {
+func (s *Selector) pickWithLease(model string, tried map[string]struct{}, preferSupplier string, skipSuppliers map[string]struct{}) (registry.UpstreamKey, string, Lease, error) {
 	s.mu.RLock()
 	reg := s.reg
 	s.mu.RUnlock()
@@ -270,20 +224,13 @@ func (s *Selector) pickWithLease(model string, tried map[string]struct{}, prefer
 	for i := range len(keys) {
 		ordered = append(ordered, keys[(start+i)%len(keys)])
 	}
-	shadowRecommended := ""
-	adaptiveConfigured := s.health != nil && s.health.AdaptiveConfigured()
-	var scores map[string]ReliabilityScore
-	if adaptiveConfigured {
-		scores = s.health.ScoreKeys(model, ordered)
-	}
-
+	// pickCandidate returns the next key in order: lowest provider Priority
+	// first (round-robin among providers tied on it), then lowest EntryPriority
+	// within the chosen provider.
 	pickCandidate := func(restrictSupplier string, blocked map[string]struct{}) (registry.UpstreamKey, bool) {
-		shadowRecommended = ""
+		eligible := make([]registry.UpstreamKey, 0, len(ordered))
 		selectedSupplier := ""
 		bestProviderPri := int(^uint(0) >> 1)
-		suppliers := make([]string, 0, len(ordered))
-		seenSuppliers := make(map[string]struct{})
-		eligible := make([]registry.UpstreamKey, 0, len(ordered))
 		for _, k := range ordered {
 			if tried != nil {
 				if _, used := tried[k.ID]; used {
@@ -307,124 +254,12 @@ func (s *Selector) pickWithLease(model string, tried map[string]struct{}, prefer
 			eligible = append(eligible, k)
 			if k.Priority < bestProviderPri {
 				bestProviderPri = k.Priority
-				suppliers = suppliers[:0]
-				seenSuppliers = make(map[string]struct{})
-			}
-			if k.Priority == bestProviderPri {
-				if _, seen := seenSuppliers[k.Name]; !seen {
-					seenSuppliers[k.Name] = struct{}{}
-					suppliers = append(suppliers, k.Name)
-				}
+				selectedSupplier = k.Name
 			}
 		}
-		if len(suppliers) == 0 {
-			return registry.UpstreamKey{}, false
-		}
-		selectedSupplier = suppliers[0]
-		recommendedSupplier := selectedSupplier
-		if adaptiveConfigured && len(suppliers) > 1 {
-			if explore {
-				bestSamples := math.Inf(1)
-				for _, supplier := range suppliers {
-					samples := s.health.ProviderSamples(model, supplier, eligible, scores)
-					if samples < bestSamples {
-						bestSamples = samples
-						recommendedSupplier = supplier
-					}
-				}
-			} else {
-				bestScore := -1.0
-				for _, supplier := range suppliers {
-					score := providerScore(model, supplier, eligible, scores)
-					if score > bestScore {
-						bestScore = score
-						recommendedSupplier = supplier
-					}
-				}
-			}
-			if s.health.AdaptiveEnabled() {
-				selectedSupplier = recommendedSupplier
-			}
-		}
-
-		candidates := make([]registry.UpstreamKey, 0, len(ordered))
-		bestEntryPri := int(^uint(0) >> 1)
-		for _, k := range ordered {
-			if k.Name != selectedSupplier {
-				continue
-			}
-			if tried != nil {
-				if _, used := tried[k.ID]; used {
-					continue
-				}
-			}
-			if _, blocked := blocked[k.ID]; blocked {
-				continue
-			}
-			if s.health != nil && !s.health.IsEligible(model, k) {
-				continue
-			}
-			if k.EntryPriority < bestEntryPri {
-				bestEntryPri = k.EntryPriority
-				candidates = candidates[:0]
-			}
-			if k.EntryPriority == bestEntryPri {
-				candidates = append(candidates, k)
-			}
-		}
+		candidates := topEntryTier(eligible, selectedSupplier)
 		if len(candidates) == 0 {
 			return registry.UpstreamKey{}, false
-		}
-		if s.health != nil && adaptiveConfigured {
-			recommended := s.health.OrderKeysWithScores(model, candidates, scores, explore)
-			if s.health.ShadowEnabled() {
-				recommendCandidates := candidates
-				if recommendedSupplier != selectedSupplier {
-					recommendCandidates = make([]registry.UpstreamKey, 0, len(ordered))
-					bestPriority := int(^uint(0) >> 1)
-					for _, candidate := range ordered {
-						if candidate.Name != recommendedSupplier {
-							continue
-						}
-						if tried != nil {
-							if _, used := tried[candidate.ID]; used {
-								continue
-							}
-						}
-						if _, blocked := blocked[candidate.ID]; blocked {
-							continue
-						}
-						if !s.health.IsEligible(model, candidate) {
-							continue
-						}
-						if candidate.EntryPriority < bestPriority {
-							bestPriority = candidate.EntryPriority
-							recommendCandidates = recommendCandidates[:0]
-						}
-						if candidate.EntryPriority == bestPriority {
-							recommendCandidates = append(recommendCandidates, candidate)
-						}
-					}
-				}
-				recommended = s.health.OrderKeysWithScores(model, recommendCandidates, scores, false)
-				if len(recommended) > 0 {
-					shadowRecommended = recommended[0].ID
-				}
-			} else if explore && len(recommended) > 0 {
-				unknown := make([]registry.UpstreamKey, 0, len(recommended))
-				for _, candidate := range recommended {
-					if scores[makeKeyScope(model, candidate)].Samples == 0 {
-						unknown = append(unknown, candidate)
-					}
-				}
-				if len(unknown) > 0 {
-					return unknown[exploreIndex%int64(len(unknown))], true
-				}
-				candidates = recommended
-			}
-			if !s.health.ShadowEnabled() && !explore {
-				candidates = recommended
-			}
 		}
 		return candidates[0], true
 	}
@@ -438,9 +273,6 @@ func (s *Selector) pickWithLease(model string, tried map[string]struct{}, prefer
 			}
 			lease, admitted := s.acquire(model, k)
 			if admitted {
-				if shadowRecommended != "" && s.health != nil {
-					s.health.RecordShadow(model, k.ID, shadowRecommended)
-				}
 				return k, lease, true
 			}
 			blocked[k.ID] = struct{}{}
@@ -450,18 +282,36 @@ func (s *Selector) pickWithLease(model string, tried map[string]struct{}, prefer
 
 	if preferSupplier != "" {
 		if k, lease, ok := tryPick(preferSupplier); ok {
-			_, upstream, err := withUpstreamModel(k, model)
-			return k, upstream, lease, err
+			return k, k.UpstreamModelOr(model), lease, nil
 		}
 	}
 	if k, lease, ok := tryPick(""); ok {
-		_, upstream, err := withUpstreamModel(k, model)
-		return k, upstream, lease, err
+		return k, k.UpstreamModelOr(model), lease, nil
 	}
 	if next := s.nextHealthRetry(model, keys, tried, skipSuppliers); !next.IsZero() {
 		return registry.UpstreamKey{}, "", Lease{}, &AvailabilityError{Model: model, RetryAt: next}
 	}
 	return registry.UpstreamKey{}, "", Lease{}, fmt.Errorf("no available credentials for model %s", model)
+}
+
+// topEntryTier returns supplier's keys from eligible that share its best
+// (lowest) EntryPriority, keeping eligible's order.
+func topEntryTier(eligible []registry.UpstreamKey, supplier string) []registry.UpstreamKey {
+	tier := make([]registry.UpstreamKey, 0, len(eligible))
+	best := int(^uint(0) >> 1)
+	for _, k := range eligible {
+		if k.Name != supplier {
+			continue
+		}
+		if k.EntryPriority < best {
+			best = k.EntryPriority
+			tier = tier[:0]
+		}
+		if k.EntryPriority == best {
+			tier = append(tier, k)
+		}
+	}
+	return tier
 }
 
 // Acquire admits an explicitly preferred key through the same health gate used
@@ -497,16 +347,6 @@ func (s *Selector) nextHealthRetry(model string, keys []registry.UpstreamKey, tr
 		return time.Time{}
 	}
 	return s.health.NextRetry(model, keys, tried, skipSuppliers)
-}
-
-func withUpstreamModel(k registry.UpstreamKey, fallback string) (registry.UpstreamKey, string, error) {
-	upstreamModel := fallback
-	if k.Headers != nil {
-		if m := k.Headers["x-lite-upstream-model"]; m != "" {
-			upstreamModel = m
-		}
-	}
-	return k, upstreamModel, nil
 }
 
 func (s *Selector) nextIndex(model string, n int) int {

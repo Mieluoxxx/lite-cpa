@@ -32,6 +32,7 @@ type UpstreamKey struct {
 	Provider      string // openai | openai-response | claude
 	BaseURL       string
 	APIKey        string
+	UpstreamModel string // upstream model id for the alias this key was registered under
 	Priority      int    // provider-level priority (lower = higher); used across the merged model pool
 	EntryPriority int    // key-level priority within the same provider Name (lower = higher)
 	Speed         string // model-level fast tier; empty blocks client-selected tiers
@@ -39,6 +40,15 @@ type UpstreamKey struct {
 	Headers       map[string]string
 	ProxyURL      string
 	FailoverMode  string // key | provider (from provider config)
+}
+
+// UpstreamModelOr returns the configured upstream model id, or alias when the
+// key was built without one.
+func (k UpstreamKey) UpstreamModelOr(alias string) string {
+	if k.UpstreamModel != "" {
+		return k.UpstreamModel
+	}
+	return alias
 }
 
 type modelEntry struct {

@@ -8,12 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"mime"
 	"mime/multipart"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,7 +53,6 @@ func New(cfg *config.Config, logger *reqlog.Logger) *Server {
 	}
 	reg := pool.BuildRegistry(cfg)
 	health := pool.NewHealthState()
-	health.ConfigureRouting(cfg.Routing.Strategy, cfg.Routing.HalfLifeDuration(), cfg.Routing.Shadow)
 	s := &Server{
 		cfg:      cfg,
 		reg:      reg,
@@ -117,7 +114,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // channel-affinity, max-body-bytes, request-log.store-body) are always applied,
 // even when the same save also touched immutable fields.
 //
-// host/port and request-log backend identity (enabled/backend/path/dsn/
+// host/port and request-log backend identity (enabled/backend/path/
 // retention) are immutable at runtime: changes there are logged as a warning
 // and the previous values stay active, but every reloadable field in the same
 // save still takes effect. Invalid configs are rejected by config.Load first.
@@ -147,7 +144,7 @@ func (s *Server) Reload(cfg *config.Config) error {
 		merged.Port = old.Port
 	}
 	if requestLogIdentity(old.RequestLog) != requestLogIdentity(cfg.RequestLog) {
-		deferred = append(deferred, "request-log enabled/backend/path/dsn/retention/body-retention")
+		deferred = append(deferred, "request-log enabled/backend/path/retention/body-retention")
 		storeBody := merged.RequestLog.StoreBody // store-body stays hot-reloadable
 		merged.RequestLog = old.RequestLog
 		merged.RequestLog.StoreBody = storeBody
@@ -157,7 +154,6 @@ func (s *Server) Reload(cfg *config.Config) error {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	s.health.Reset()
-	s.health.ConfigureRouting(merged.Routing.Strategy, merged.Routing.HalfLifeDuration(), merged.Routing.Shadow)
 	s.affinity.Reset()
 	s.reg.ReplaceFrom(nextReg)
 	s.selector.SetRetry(merged.RequestRetry)
@@ -180,11 +176,10 @@ func (s *Server) Reload(cfg *config.Config) error {
 }
 
 func requestLogIdentity(c config.RequestLogConfig) string {
-	return fmt.Sprintf("%t|%s|%s|%s|%s|%s",
+	return fmt.Sprintf("%t|%s|%s|%s|%s",
 		c.Enabled,
 		strings.ToLower(strings.TrimSpace(c.Backend)),
 		strings.TrimSpace(c.SQLite.Path),
-		strings.TrimSpace(c.Postgres.DSN),
 		strings.TrimSpace(c.Retention),
 		strings.TrimSpace(c.BodyRetention),
 	)
@@ -348,10 +343,6 @@ func (l *requestLog) flush(retried bool) {
 	l.logger.Record(rec)
 }
 
-func (s *Server) observeAttempt(reqID string, attempt int, model string, key registry.UpstreamKey, lease pool.Lease, status int, outcome pool.AttemptOutcome, startedAt, firstByteAt time.Time, retryAfter ...time.Duration) {
-	s.observeAttemptWithTokens(reqID, attempt, model, key, lease, status, outcome, startedAt, firstByteAt, 0, false, retryAfter...)
-}
-
 func (s *Server) observeAttemptWithTokens(reqID string, attempt int, model string, key registry.UpstreamKey, lease pool.Lease, status int, outcome pool.AttemptOutcome, startedAt, firstByteAt time.Time, outputTokens int64, outputKnown bool, retryAfter ...time.Duration) {
 	if s.selector == nil {
 		return
@@ -364,10 +355,6 @@ func (s *Server) observeAttemptWithTokens(reqID string, attempt int, model strin
 	if len(retryAfter) > 0 {
 		retryAfterDuration = retryAfter[0]
 	}
-	actualModel := model
-	if key.Headers != nil && key.Headers["x-lite-upstream-model"] != "" {
-		actualModel = key.Headers["x-lite-upstream-model"]
-	}
 	s.selector.Finish(lease, pool.AttemptResult{
 		RequestID:         reqID,
 		Attempt:           attempt + 1,
@@ -375,7 +362,7 @@ func (s *Server) observeAttemptWithTokens(reqID string, attempt int, model strin
 		KeyID:             key.ID,
 		Provider:          key.Provider,
 		Upstream:          key.Name,
-		ActualModel:       actualModel,
+		ActualModel:       key.UpstreamModelOr(model),
 		Status:            status,
 		Outcome:           outcome,
 		DurationMS:        time.Since(startedAt).Milliseconds(),
@@ -494,487 +481,6 @@ func withRecover(next http.Handler) http.Handler {
 // forward runs the shared upstream-selection + retry + write-back loop used by
 // every proxy handler. execute is the single handler-specific step: chat /
 // responses translation for handleProxy, raw image passthrough for handleImages.
-func (s *Server) forward(
-	w http.ResponseWriter, r *http.Request,
-	reqID, protocol, model, resolveName string,
-	body []byte, start time.Time,
-	execute func(ctx context.Context, key registry.UpstreamKey, upstreamModel string) (any, error),
-) {
-	rows := &requestLog{logger: s.logger}
-	defer rows.flush(false)
-	s.stateMu.RLock()
-	requestGeneration := s.health.Generation()
-	aff := s.affinity.Lookup(resolveName, r.URL.Path, r.Header, body)
-	if aff.Found {
-		if s.debugEnabled() {
-			log.Printf("affinity hit rule=%s key=%s", aff.RuleName, aff.KeyID)
-		}
-	}
-
-	tried := make(map[string]struct{})
-	skipSuppliers := make(map[string]struct{})
-	preferSupplier := ""
-	// Resolve the sticky (preferred) key once. Skip-retry only applies when the
-	// pinned key is actually usable: after a reload it may have vanished, and
-	// the request then falls back to normal selection with a full retry budget.
-	var preferredKey registry.UpstreamKey
-	preferredUsable := false
-	var preferredLease pool.Lease
-	if aff.Found {
-		if _, keys, ok := s.reg.Resolve(resolveName); ok {
-			if k, ok := affinity.ResolvePreferred(keys, aff.KeyID, tried); ok {
-				if lease, admitted := s.selector.Acquire(resolveName, k); admitted {
-					preferredKey = k
-					preferredLease = lease
-					preferredUsable = true
-				}
-			}
-		}
-	}
-	maxAttempts := s.selector.MaxAttempts(resolveName)
-	s.stateMu.RUnlock()
-	if aff.Found && !preferredUsable {
-		s.affinity.MarkPreferredUnavailable()
-	}
-
-	// Keepalive spans both halves of a streamed request: the wait for the
-	// upstream's first event (the executor blocks on it before returning) and
-	// every later gap between events. Committing the 200 from here is a
-	// deliberate trade — the client gets bytes instead of silence, and a failure
-	// that shows up afterwards is reported in-band because the status can no
-	// longer change. Only requests that asked for stream: true are affected.
-	var keepalive *streamKeepalive
-	if gjson.GetBytes(body, "stream").Bool() {
-		keepalive = s.newStreamKeepalive(protocol)
-	}
-	if _, ok := w.(http.Flusher); !ok {
-		keepalive = nil
-	}
-	defer keepalive.Stop()
-	committed := false
-	commitStream := func() {
-		if committed {
-			return
-		}
-		committed = true
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(http.StatusOK)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-	}
-
-	recordAffinity := func(key registry.UpstreamKey) {
-		s.stateMu.RLock()
-		defer s.stateMu.RUnlock()
-		if requestGeneration != s.health.Generation() || !aff.Matched || aff.CacheKey == "" {
-			return
-		}
-		if s.currentCfg().ChannelAffinity.SwitchOnSuccessOrDefault() || !aff.Found || aff.KeyID == key.ID {
-			s.affinity.Record(aff.CacheKey, key.ID, aff.TTL)
-			if s.debugEnabled() {
-				log.Printf("affinity recorded rule=%s key=%s", aff.RuleName, key.ID)
-			}
-		}
-	}
-	clearAffinity := func(keyID string) {
-		s.stateMu.RLock()
-		defer s.stateMu.RUnlock()
-		if requestGeneration != s.health.Generation() || !aff.Matched || aff.CacheKey == "" || keyID != aff.KeyID {
-			return
-		}
-		s.affinity.Clear(aff.CacheKey)
-		if s.debugEnabled() {
-			log.Printf("affinity cleared rule=%s key=%s", aff.RuleName, keyID)
-		}
-	}
-	if preferredUsable && aff.SkipRetry {
-		maxAttempts = 1
-	}
-	var lastErr error
-	var availabilityErr *pool.AvailabilityError
-	lastErrLogged := false
-	var lastKey registry.UpstreamKey
-	for attempt := range maxAttempts {
-		var key registry.UpstreamKey
-		var upstreamModel string
-		lease := pool.Lease{}
-		var pickErr error
-
-		if attempt == 0 && preferredUsable {
-			key = preferredKey
-			upstreamModel = resolveName
-			if preferredKey.Headers != nil {
-				if m := preferredKey.Headers["x-lite-upstream-model"]; m != "" {
-					upstreamModel = m
-				}
-			}
-			preferSupplier = preferredKey.Name
-		}
-		if key.ID == "" {
-			s.stateMu.RLock()
-			if attempt == 0 && !preferredUsable {
-				key, upstreamModel, lease, pickErr = s.selector.PickWithLeaseExploring(resolveName, tried, preferSupplier, skipSuppliers)
-			} else {
-				key, upstreamModel, lease, pickErr = s.selector.PickWithLease(resolveName, tried, preferSupplier, skipSuppliers)
-			}
-			s.stateMu.RUnlock()
-			if pickErr != nil {
-				lastErr = pickErr
-				var ae *pool.AvailabilityError
-				if errors.As(pickErr, &ae) {
-					availabilityErr = ae
-				}
-				lastErrLogged = false
-				break
-			}
-			if preferSupplier == "" {
-				preferSupplier = key.Name
-			}
-		} else {
-			lease = preferredLease
-			preferredLease = pool.Lease{}
-		}
-		tried[key.ID] = struct{}{}
-		rows.flush(true)
-		lastKey = key
-
-		if thinking.ParseSuffix(model).HasSuffix {
-			suffix := thinking.ParseSuffix(model).RawSuffix
-			upstreamModel = thinking.ParseSuffix(upstreamModel).ModelName + "(" + suffix + ")"
-		}
-
-		attemptStart := time.Now()
-		attemptCtx, cancelAttempt := context.WithCancel(r.Context())
-		leasePtr := &lease
-		defer func(l *pool.Lease, cancel context.CancelFunc) {
-			cancel()
-			s.selector.Release(*l)
-		}(leasePtr, cancelAttempt)
-
-		// The executor blocks until the upstream's first SSE event, so when
-		// keepalive is armed the call runs in its own goroutine and is raced
-		// against the frame timer; a cancel closes the wait instead of holding the
-		// lease until the upstream decides to answer. Without keepalive (every
-		// non-stream request, and streams with it disabled) the attempt stays on
-		// this goroutine so a panic still unwinds through withRecover.
-		var result any
-		var err error
-		if keepalive == nil {
-			result, err = execute(attemptCtx, key, upstreamModel)
-		} else {
-			done := make(chan attemptOutcome, 1)
-			go func() {
-				defer func() {
-					if rec := recover(); rec != nil {
-						done <- attemptOutcome{err: fmt.Errorf("executor panic: %v", rec)}
-					}
-				}()
-				res, execErr := execute(attemptCtx, key, upstreamModel)
-				done <- attemptOutcome{result: res, err: execErr}
-			}()
-		waitAttempt:
-			for {
-				select {
-				case out := <-done:
-					result, err = out.result, out.err
-					break waitAttempt
-				case <-keepalive.C():
-					commitStream()
-					if _, writeErr := w.Write(keepalive.frame); writeErr != nil {
-						result, err = nil, fmt.Errorf("%w: %v", errStreamWriteFailed, writeErr)
-						break waitAttempt
-					}
-					if f, ok := w.(http.Flusher); ok {
-						f.Flush()
-					}
-					keepalive.Reset()
-				case <-attemptCtx.Done():
-					result, err = nil, attemptCtx.Err()
-					break waitAttempt
-				}
-			}
-		}
-		if err != nil {
-			cancelAttempt()
-			if errors.Is(err, errStreamWriteFailed) {
-				s.observeAttempt(reqID, attempt, resolveName, key, lease, 0, pool.OutcomeCanceled, attemptStart, time.Time{})
-				rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, 0, reqlog.OutcomeClientCanceled, attemptStart, err.Error(), body, nil))
-				return
-			}
-			if ctxErr := r.Context().Err(); ctxErr != nil {
-				s.observeAttempt(reqID, attempt, resolveName, key, lease, 0, pool.OutcomeCanceled, attemptStart, time.Time{})
-				rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, 0, reqlog.OutcomeClientCanceled, attemptStart, ctxErr.Error(), body, nil))
-				return
-			}
-			lastErr = err
-			lastErrLogged = false
-			if se, ok := err.(executor.StatusError); ok {
-				if se.Code == 401 || se.Code == 403 || se.Code == 429 || se.Code >= 500 {
-					clearAffinity(key.ID)
-					s.observeAttempt(reqID, attempt, resolveName, key, lease, se.Code, classifyAttempt(err, se.Code), attemptStart, time.Time{}, se.RetryAfter)
-					rows.hold(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, se.Code, reqlog.OutcomeError, attemptStart, se.Error(), body, nil))
-					lastErrLogged = true
-					if s.debugEnabled() {
-						log.Printf("upstream %s/%s failed status=%d, rotating (mode=%s)", key.Name, key.ID, se.Code, key.FailoverMode)
-					}
-					if aff.Found && aff.SkipRetry && key.ID == aff.KeyID {
-						break
-					}
-					if key.FailoverMode == "provider" {
-						skipSuppliers[key.Name] = struct{}{}
-						if preferSupplier == key.Name {
-							preferSupplier = ""
-						}
-					}
-					continue
-				}
-				s.observeAttempt(reqID, attempt, resolveName, key, lease, se.Code, pool.OutcomeRequestError, attemptStart, time.Time{})
-				errBody := normalizeErrorBody(se.Body)
-				if committed {
-					writeSSEError(w, protocol, streamErrorMessage(errBody, se.Error()))
-				} else {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(se.Code)
-					_, _ = w.Write(errBody)
-				}
-				rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, se.Code, reqlog.OutcomeError, start, se.Error(), body, errBody))
-				return
-			}
-			clearAffinity(key.ID)
-			s.observeAttempt(reqID, attempt, resolveName, key, lease, http.StatusBadGateway, classifyAttempt(err, 0), attemptStart, time.Time{})
-			rows.hold(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, http.StatusBadGateway, reqlog.OutcomeError, attemptStart, err.Error(), body, nil))
-			lastErrLogged = true
-			if aff.Found && aff.SkipRetry && key.ID == aff.KeyID {
-				break
-			}
-			if key.FailoverMode == "provider" {
-				skipSuppliers[key.Name] = struct{}{}
-				if preferSupplier == key.Name {
-					preferSupplier = ""
-				}
-			}
-			continue
-		}
-		if ctxErr := r.Context().Err(); ctxErr != nil {
-			cancelAttempt()
-			s.observeAttempt(reqID, attempt, resolveName, key, lease, 0, pool.OutcomeCanceled, attemptStart, time.Time{})
-			rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, 0, reqlog.OutcomeClientCanceled, attemptStart, ctxErr.Error(), body, nil))
-			return
-		}
-
-		switch v := result.(type) {
-		case *executor.Result:
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, writeErr := w.Write(v.Body)
-			usage := usageFromResponse(v.Body)
-			outcome := reqlog.OutcomeCompleted
-			errMsg := ""
-			if writeErr != nil {
-				outcome = reqlog.OutcomeClientCanceled
-				errMsg = writeErr.Error()
-			} else if ctxErr := r.Context().Err(); ctxErr != nil {
-				outcome = reqlog.OutcomeClientCanceled
-				errMsg = ctxErr.Error()
-			}
-			if outcome == reqlog.OutcomeCompleted {
-				s.observeAttemptWithTokens(reqID, attempt, resolveName, key, lease, v.Status, pool.OutcomeSuccess, attemptStart, time.Time{}, usage.outputTokens, usage.outputSeen)
-				recordAffinity(key)
-			} else {
-				s.observeAttempt(reqID, attempt, resolveName, key, lease, v.Status, pool.OutcomeCanceled, attemptStart, time.Time{})
-			}
-			cancelAttempt()
-			rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, http.StatusOK, outcome, start, errMsg, body, v.Body, usage))
-			return
-		case *executor.StreamResult:
-			flusher, ok := w.(http.Flusher)
-			if !ok {
-				cancelAttempt()
-				s.observeAttempt(reqID, attempt, resolveName, key, lease, http.StatusInternalServerError, pool.OutcomeRequestError, attemptStart, time.Time{})
-				writeAPIError(w, http.StatusInternalServerError, "server_error", "streaming not supported")
-				rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, http.StatusInternalServerError, reqlog.OutcomeError, start, "streaming not supported", body, nil))
-				return
-			}
-			commitStream()
-			flusher.Flush()
-			var streamErr string
-			clientCanceled := false
-			streamAborted := false
-			var firstByteAt time.Time
-			var usage tokenUsage
-			streamDone := false
-			for !streamDone {
-				select {
-				case <-r.Context().Done():
-					clientCanceled = true
-					streamAborted = true
-					streamErr = r.Context().Err().Error()
-					cancelAttempt()
-					streamDone = true
-				case <-keepalive.C():
-					// Synthetic frame: the upstream has been silent past the idle
-					// interval. It deliberately does not count as firstByteAt — no
-					// upstream byte arrived.
-					if _, err := w.Write(keepalive.frame); err != nil {
-						clientCanceled = true
-						streamAborted = true
-						streamErr = err.Error()
-						cancelAttempt()
-						streamDone = true
-						continue
-					}
-					flusher.Flush()
-					keepalive.Reset()
-				case chunk, ok := <-v.Chunks:
-					if !ok {
-						streamDone = true
-						continue
-					}
-					if chunk.Err != nil {
-						streamAborted = true
-						cancelAttempt()
-						if s.debugEnabled() {
-							log.Printf("stream error: %v", chunk.Err)
-						}
-						streamErr = chunk.Err.Error()
-						streamDone = true
-						continue
-					}
-					if chunk.LogError != "" && streamErr == "" {
-						streamErr = chunk.LogError
-					}
-					if len(chunk.Payload) == 0 {
-						continue
-					}
-					if firstByteAt.IsZero() {
-						firstByteAt = time.Now()
-					}
-					usage.mergePayload(chunk.Payload)
-					if _, err := w.Write(chunk.Payload); err != nil {
-						streamErr = err.Error()
-						clientCanceled = true
-						streamAborted = true
-						cancelAttempt()
-						streamDone = true
-						continue
-					}
-					flusher.Flush()
-					keepalive.observe(chunk.Payload)
-					keepalive.Reset()
-				}
-			}
-			if ctxErr := r.Context().Err(); ctxErr != nil {
-				clientCanceled = true
-				streamErr = ctxErr.Error()
-			}
-			completion := executor.StreamFailed
-			if !streamAborted && !clientCanceled {
-				if v.Complete != nil {
-					select {
-					case completion = <-v.Complete:
-					case <-r.Context().Done():
-						clientCanceled = true
-						streamAborted = true
-						streamErr = r.Context().Err().Error()
-					}
-				} else {
-					streamErr = "upstream stream ended without a completion status"
-				}
-				if completion == executor.StreamIncomplete && streamErr == "" {
-					streamErr = "upstream stream ended with an incomplete response"
-				}
-				if completion != executor.StreamCompleted && completion != executor.StreamIncomplete && streamErr == "" {
-					streamErr = "upstream stream ended before completion"
-				}
-			}
-			cancelAttempt()
-			outcome := reqlog.OutcomeCompleted
-			if clientCanceled {
-				outcome = reqlog.OutcomeClientCanceled
-			} else if streamErr != "" {
-				outcome = reqlog.OutcomeError
-			}
-			if outcome == reqlog.OutcomeCompleted && completion == executor.StreamCompleted {
-				s.observeAttemptWithTokens(reqID, attempt, resolveName, key, lease, v.Status, pool.OutcomeSuccess, attemptStart, firstByteAt, usage.outputTokens, usage.outputSeen)
-				recordAffinity(key)
-			} else if clientCanceled {
-				s.observeAttemptWithTokens(reqID, attempt, resolveName, key, lease, v.Status, pool.OutcomeCanceled, attemptStart, firstByteAt, usage.outputTokens, usage.outputSeen)
-			} else {
-				attemptOutcome := pool.OutcomeUpstream
-				if completion == executor.StreamIncomplete {
-					attemptOutcome = pool.OutcomeRequestError
-				}
-				if !clientCanceled {
-					clearAffinity(key.ID)
-				}
-				s.observeAttemptWithTokens(reqID, attempt, resolveName, key, lease, v.Status, attemptOutcome, attemptStart, firstByteAt, usage.outputTokens, usage.outputSeen)
-			}
-			rows.emit(s.newLogRecord(reqID, r, protocol, model, key.Provider, key.Name, http.StatusOK, outcome, start, streamErr, body, nil, usage))
-			return
-		default:
-			cancelAttempt()
-			s.observeAttempt(reqID, attempt, resolveName, key, lease, http.StatusBadGateway, pool.OutcomeUpstream, attemptStart, time.Time{})
-			lastErr = fmt.Errorf("unexpected executor result type %T", result)
-			lastErrLogged = false
-		}
-	}
-	if availabilityErr != nil {
-		seconds := int64(math.Ceil(time.Until(availabilityErr.RetryAt).Seconds()))
-		if seconds < 1 {
-			seconds = 1
-		}
-		w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
-		msg := fmt.Sprintf("all upstream credentials are cooling down for model %s", availabilityErr.Model)
-		if committed {
-			writeSSEError(w, protocol, msg)
-		} else {
-			writeAPIError(w, http.StatusTooManyRequests, "rate_limit_error", msg)
-		}
-		rows.emit(s.newLogRecord(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, http.StatusTooManyRequests, reqlog.OutcomeError, start, msg, body, nil))
-		return
-	}
-
-	if lastErr != nil {
-		if se, ok := lastErr.(executor.StatusError); ok {
-			errBody := normalizeErrorBody(se.Body)
-			if committed {
-				writeSSEError(w, protocol, streamErrorMessage(errBody, se.Error()))
-			} else {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(se.Code)
-				_, _ = w.Write(errBody)
-			}
-			if !lastErrLogged {
-				rows.emit(s.newLogRecord(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, se.Code, reqlog.OutcomeError, start, se.Error(), body, errBody))
-			}
-			return
-		}
-		msg := lastErr.Error()
-		code := http.StatusBadGateway
-		if strings.Contains(msg, "model not found") {
-			code = http.StatusNotFound
-		}
-		if committed {
-			writeSSEError(w, protocol, msg)
-		} else {
-			writeAPIError(w, code, "server_error", msg)
-		}
-		if !lastErrLogged {
-			rows.emit(s.newLogRecord(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, code, reqlog.OutcomeError, start, msg, body, nil))
-		}
-		return
-	}
-	if committed {
-		writeSSEError(w, protocol, "all upstream credentials failed")
-	} else {
-		writeAPIError(w, http.StatusBadGateway, "server_error", "all upstream credentials failed")
-	}
-	rows.emit(s.newLogRecord(reqID, r, protocol, model, lastKey.Provider, lastKey.Name, http.StatusBadGateway, reqlog.OutcomeError, start, "all upstream credentials failed", body, nil))
-}
-
 // handleImages proxies OpenAI Images API requests (/v1/images/generations,
 // /v1/images/edits) to an upstream that already speaks the standard Images
 // API. The body — JSON or multipart — is forwarded verbatim; only model and

@@ -93,29 +93,7 @@ func (s *Server) handleRoutingStats(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
 	}
-	cfg := s.currentCfg()
-	strategy := "priority"
-	shadow := false
-	if cfg != nil {
-		strategy = cfg.Routing.Strategy
-		shadow = cfg.Routing.Shadow
-	}
-	if strings.TrimSpace(strategy) == "" {
-		strategy = "priority"
-	}
-	reason := "provider-priority, entry-priority, round-robin"
-	if strategy == "adaptive" && !shadow {
-		reason = "same-priority reliability, then round-robin"
-	} else if strategy == "adaptive" {
-		reason = "shadow-only; selection unchanged"
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"strategy":               strategy,
-		"shadow":                 shadow,
-		"selection_reason":       reason,
-		"items":                  s.health.Snapshot(),
-		"shadow_recommendations": s.health.ShadowSnapshot(),
-	})
+	writeJSON(w, http.StatusOK, map[string]any{"items": s.health.Snapshot()})
 }
 
 func (s *Server) handleLogsClear(w http.ResponseWriter, r *http.Request) {

@@ -22,7 +22,7 @@ lite-cpa is a slim Go gateway: protocol conversion among OpenAI Chat Completions
 | `internal/executor/` | Upstream HTTP + stream/non-stream |
 | `internal/translator/` | Format conversion (`chat` ↔ `responses` ↔ `claude`) |
 | `internal/config/` | YAML load, defaults, validation |
-| `internal/reqlog/` | Optional SQLite / Postgres request log |
+| `internal/reqlog/` | Optional SQLite request log |
 | `config/config.example.yaml` | Minimal scaffold (details live in this file) |
 | `docs/Channel-Affinity-and-Retry.md` | Affinity + retry + failover (EN) |
 | `docs/渠道亲和与重试.md` | 亲和 + 重试 + 切换（中文） |
@@ -66,7 +66,6 @@ Copy `config/config.example.yaml` → `config/config.yaml`. **At least one** of 
 | `max-body-bytes` | `32MiB` | Inbound body limit |
 | `proxy-url` | empty | Global outbound proxy fallback if provider has none |
 | `channel-affinity` | on by default | See [Channel affinity](#channel-affinity) |
-| `routing` | `priority` | Optional same-priority reliability-aware selection; see [Adaptive routing](#adaptive-routing) |
 | `request-log` | disabled | See [Request log](#request-log) |
 
 ### Provider sections
@@ -200,12 +199,6 @@ sse-keepalive:
 
 **Upstream encoding.** `Accept-Encoding` is not configurable per provider: setting it by hand disables Go's transparent gzip decoding, and forcing `gzip` on a stream would let an upstream that compresses without flushing per event batch the events and destroy incrementality. Streaming Claude requests pin `identity` for that reason; other requests use the transport default (auto `gzip` + transparent decode). Config validation rejects a provider `headers` entry that sets `Accept-Encoding` to anything but `identity`.
 
-### Adaptive routing
-
-`routing.strategy` defaults to `priority`, preserving provider priority, key entry priority, and round-robin behavior. Set `adaptive` to rank candidates only within the same provider/entry priority tier using decay-weighted Beta reliability; affinity and cooldown gates still run first. `half-life` defaults to `72h`. `shadow: true` collects reliability observations and an adaptive recommendation in `/api/routing/stats` without changing selection.
-
-Adaptive routing is intentionally reliability-only in this phase. It does not infer quotas, rewrite configuration priorities, or use randomized Thompson sampling. Unknown keys use the neutral Beta prior and retain deterministic round-robin order, providing bounded cold-start exploration.
-
 ### Request log
 
 Optional structured log (stderr diagnostics always available).
@@ -213,14 +206,13 @@ Optional structured log (stderr diagnostics always available).
 | Field | Meaning |
 |---|---|
 | `enabled` | default false |
-| `backend` | `sqlite` or `postgres` |
+| `backend` | `sqlite` (the only backend) |
 | `retention` | Go duration for whole rows; default `0s` = keep forever; hourly cleanup when > 0 |
 | `store-body` | default false; bodies capped 64KiB; **streams omit response body** |
 | `body-retention` | default `168h`; clears bodies (keeps the row) older than this; only matters with `store-body` |
 
 Rows are per upstream attempt; a failed attempt superseded by a retry is `retried=true` (held in `server.requestLog` until the next attempt starts). `Insert` also upserts `usage_hourly` (UTC hour × user_agent × model) in the same transaction; the rollup is never pruned and survives "clear logs". `GET /api/usage?bucket=day|weekhour&days=&tz=` folds it into the caller's local days for the dashboard.
 | `sqlite.path` | default `logs/requests.db` |
-| `postgres.dsn` | required when backend is postgres |
 
 ### Minimal recipes
 
@@ -330,7 +322,7 @@ Runtime reloads the YAML without dropping the listen socket:
 
 **Hot-swapped:** `api-keys`, providers/models/keys/priority/failover, `request-retry`, `channel-affinity`, `debug`, `compression`, `sse-keepalive`, `max-body-bytes`, `request-log.store-body`, global `proxy-url` (via rebuilt keys). These are applied even when the same save also touched an immutable field below.
 
-**Require restart (ignored until restart, logged as a warning):** `host`, `port`, and request-log `enabled` / `backend` / sqlite path / postgres DSN / `retention` / `body-retention` (logger is opened once at boot). Drift here does **not** abort the reload — the previous values stay active and every reloadable field in the same save still takes effect; the warning re-fires on each reload until the process is restarted.
+**Require restart (ignored until restart, logged as a warning):** `host`, `port`, and request-log `enabled` / `backend` / sqlite path / `retention` / `body-retention` (logger is opened once at boot). Drift here does **not** abort the reload — the previous values stay active and every reloadable field in the same save still takes effect; the warning re-fires on each reload until the process is restarted.
 
 Invalid YAML or validation errors keep the previous config entirely and log `config reload: ... (keeping previous config)`.
 
@@ -353,23 +345,7 @@ docker compose down
 
 - Image: multi-stage `golang:1.26-alpine` → `alpine:3.23`, non-root user `lite` (uid 10001).
 - Env: `TZ=Asia/Shanghai` (override as needed).
-- Config hot-reload: edit `config/config.yaml` in place (or `kill -HUP <pid>`). Providers / keys / models / affinity / `api-keys` / `request-retry` / `debug` / `max-body-bytes` apply without restart. `host`/`port` and request-log enable/backend/path/dsn/retention/body-retention are ignored until restart (logged as a warning; the rest of that save still applies).
-#### Optional Postgres for request-log
-
-1. Uncomment the `postgres` service in `docker-compose.yml`.
-2. Uncomment `depends_on` on `lite-cpa`.
-3. In `config/config.yaml`:
-
-```yaml
-request-log:
-  enabled: true
-  backend: postgres
-  retention: "0s"
-  store-body: false
-  postgres:
-    dsn: "postgres://litecpa:litecpa@postgres:5432/litecpa?sslmode=disable"
-```
-
+- Config hot-reload: edit `config/config.yaml` in place (or `kill -HUP <pid>`). Providers / keys / models / affinity / `api-keys` / `request-retry` / `debug` / `max-body-bytes` apply without restart. `host`/`port` and request-log enable/backend/path/retention/body-retention are ignored until restart (logged as a warning; the rest of that save still applies).
 ### Plain Docker
 
 ```bash
@@ -394,7 +370,7 @@ Entrypoint: `lite-cpa --config /app/config/config.yaml`.
 - [ ] `config/config.yaml` has gateway `api-keys` and ≥1 upstream provider
 - [ ] Official vs relay: `failover-mode` set (`key` vs `provider`)
 - [ ] `curl /healthz` and one real model call succeed
-- [ ] Logs: process → stderr; optional request-log → sqlite/postgres path
+- [ ] Logs: process → stderr; optional request-log → sqlite path
 
 
 ---

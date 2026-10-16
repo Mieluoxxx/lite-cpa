@@ -157,22 +157,3 @@ func TestForwardPanicReleasesLease(t *testing.T) {
 		t.Fatalf("panic path did not cancel attempt context: %v", callbackCtx)
 	}
 }
-
-func TestRoutingAdaptiveReloadAndStats(t *testing.T) {
-	cfg := &config.Config{RequestRetry: 0, OpenAICompletions: []config.Provider{{Name: "mock", BaseURL: "https://mock.example", APIKey: "sk-a", Models: []config.ModelAlias{{Name: "m"}}}}}
-	s := New(cfg, nil)
-	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-	next := *cfg
-	next.Routing = config.RoutingConfig{Strategy: "adaptive", HalfLife: "24h", Shadow: false}
-	if err := s.Reload(&next); err != nil {
-		t.Fatal(err)
-	}
-	if !s.health.AdaptiveEnabled() {
-		t.Fatal("adaptive routing was not enabled after reload")
-	}
-	w := httptest.NewRecorder()
-	s.handleRoutingStats(w, httptest.NewRequest(http.MethodGet, "/api/routing/stats", nil))
-	if !strings.Contains(w.Body.String(), `"strategy":"adaptive"`) || strings.Contains(w.Body.String(), `"shadow":true`) {
-		t.Fatalf("routing stats=%s", w.Body.String())
-	}
-}

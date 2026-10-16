@@ -4,7 +4,7 @@
 
 Slim Go gateway for protocol conversion among **OpenAI Chat Completions**, **OpenAI Responses**, and **Anthropic Messages**.
 
-Single binary · config multi-key pools · optional request recording (SQLite / Postgres) · no control plane.
+Single binary · config multi-key pools · optional request recording (SQLite) · no control plane.
 
 Based on [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) by Luis Pater / Router-For.ME.
 
@@ -19,7 +19,7 @@ Based on [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) by Lu
 - **gzip response compression** when the client sends `Accept-Encoding: gzip`, including SSE streams that still flush per event
 - **Stream keepalive frames** during upstream silence (Responses `response.in_progress`, Chat `: keepalive`, Messages `event: ping`)
 - Accepts gzip / deflate / zstd compressed request bodies, with a decompressed-size cap
-- Optional request log: SQLite or Postgres with retention cleanup
+- Optional request log: SQLite with retention cleanup
 - Binary / Docker / Compose deployment
 
 ## Docs
@@ -97,14 +97,12 @@ debug: false
 # Optional request recording
 request-log:
   enabled: false
-  backend: "sqlite"       # sqlite | postgres
+  backend: "sqlite"
   retention: "0s"         # rows kept forever; set e.g. "720h" to delete old rows hourly
   store-body: false       # metadata only by default; streams never store resp body
   body-retention: "168h"  # with store-body: clear bodies after 7 days, keep the row
   sqlite:
     path: "logs/requests.db"
-  # postgres:
-  #   dsn: "postgres://litecpa:litecpa@postgres:5432/litecpa?sslmode=disable"
 
 anthropic-messages:
   - name: anthropic-official
@@ -238,23 +236,18 @@ channel-affinity: [claude, gpt, grok]
 
 Sticky identity catalog: `internal/affinity/cli_sessions.go`. First present wins: product headers (`X-Claude-Code-Session-Id`, `x-opencode-session`, `x-session-affinity`) → Codex/Pi session/thread → `X-Session-Id` → `X-Client-Request-Id` → protocol body (`/v1/messages` normalizes `metadata.user_id`; responses/chat use `prompt_cache_key`). Details: [Channel Affinity and Retry](docs/Channel-Affinity-and-Retry.md). No identity → normal round-robin.
 
-### Optional adaptive routing
-
-The default `routing.strategy: priority` preserves the existing provider/key order. `routing.strategy: adaptive` ranks only within the same provider and entry-priority tier using decay-weighted Beta reliability; affinity and cooldown gates remain authoritative. `half-life` defaults to `72h`; `shadow: true` collects scores and recommendations without changing picks. Cold-start keys use a neutral prior and at most one deterministic same-tier exploration every ten non-affinity selections; quota estimation and randomized Thompson sampling are intentionally not enabled here.
-
 ### Request log
 
 | Field | Meaning |
 |---|---|
 | `enabled` | default `false` |
-| `backend` | `sqlite` or `postgres` |
+| `backend` | `sqlite` (the only backend) |
 | `retention` | Go duration for whole rows. Default `0s` = keep forever; e.g. `720h` deletes older rows hourly. |
 | `store-body` | default `false`; if true, bodies capped at 64KiB; **SSE response bodies are not stored** |
 | `body-retention` | Go duration, default `168h`. Clears stored bodies older than this but keeps the row; only matters with `store-body: true`. `0s` never clears. |
 
 Each request writes one row per upstream attempt; a failed attempt that was retried on another key is flagged `retried`. Every row is also folded into an hourly rollup (`usage_hourly`: hour × User-Agent × model) that `retention` and "clear logs" never delete; the dashboard's heatmap and per-agent stats read from it via `GET /api/usage`. Metadata rows take roughly 200–250 bytes each in SQLite.
 | `sqlite.path` | default `logs/requests.db` |
-| `postgres.dsn` | required when backend is postgres |
 
 Process diagnostics still go to **stderr** only (not the DB).
 
@@ -275,23 +268,6 @@ Mounts:
 - `./logs` → `/app/logs` (sqlite path when enabled)
 
 Listens on port `8317`. Default timezone `Asia/Shanghai` (`TZ`).
-
-### Postgres backend (optional)
-
-1. Uncomment the `postgres` service in `docker-compose.yml`.
-2. Set in `config/config.yaml`:
-
-```yaml
-request-log:
-  enabled: true
-  backend: postgres
-  retention: "0s"
-  store-body: false
-  postgres:
-    dsn: "postgres://litecpa:litecpa@postgres:5432/litecpa?sslmode=disable"
-```
-
-3. Uncomment `depends_on` for `lite-cpa`.
 
 ### Plain docker
 

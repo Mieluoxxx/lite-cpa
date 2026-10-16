@@ -1,7 +1,6 @@
 package pool
 
 import (
-	"math"
 	"sort"
 	"sync"
 	"time"
@@ -80,9 +79,6 @@ type healthEntry struct {
 	lastFirstChunkKnown bool
 	lastOutputKnown     bool
 	lastActualModel     string
-	scoreSuccess        float64
-	scoreFailure        float64
-	scoreUpdatedAt      time.Time
 	cooldownUntil       time.Time
 	probeToken          uint64
 }
@@ -108,36 +104,17 @@ type HealthSnapshot struct {
 	LastActualModel       string         `json:"last_actual_model,omitempty"`
 	CooldownUntil         *time.Time     `json:"cooldown_until,omitempty"`
 	ProviderCooldownUntil *time.Time     `json:"provider_cooldown_until,omitempty"`
-	Reliability           *float64       `json:"reliability,omitempty"`
-	ScoreSamples          float64        `json:"score_samples"`
-}
-
-type ReliabilityScore struct {
-	Value   float64 `json:"value"`
-	Samples float64 `json:"samples"`
-}
-
-type ShadowRecommendation struct {
-	Model          string `json:"model"`
-	ActualKey      string `json:"actual_key"`
-	RecommendedKey string `json:"recommended_key"`
-	Observations   int64  `json:"observations"`
 }
 
 // HealthState keeps short-lived cross-request key health in process memory.
 // It intentionally does not persist credentials or raw API keys.
 type HealthState struct {
-	mu                    sync.Mutex
-	generation            uint64
-	nextToken             uint64
-	keys                  map[string]*healthEntry
-	providers             map[string]*healthEntry
-	leases                map[uint64]leaseRecord
-	halfLife              time.Duration
-	strategy              string
-	shadow                bool
-	exploration           map[string]int64
-	shadowRecommendations map[string]*ShadowRecommendation
+	mu         sync.Mutex
+	generation uint64
+	nextToken  uint64
+	keys       map[string]*healthEntry
+	providers  map[string]*healthEntry
+	leases     map[uint64]leaseRecord
 }
 
 const (
@@ -149,108 +126,11 @@ const (
 
 func NewHealthState() *HealthState {
 	return &HealthState{
-		generation:            1,
-		keys:                  make(map[string]*healthEntry),
-		providers:             make(map[string]*healthEntry),
-		leases:                make(map[uint64]leaseRecord),
-		halfLife:              72 * time.Hour,
-		strategy:              "priority",
-		exploration:           make(map[string]int64),
-		shadowRecommendations: make(map[string]*ShadowRecommendation),
+		generation: 1,
+		keys:       make(map[string]*healthEntry),
+		providers:  make(map[string]*healthEntry),
+		leases:     make(map[uint64]leaseRecord),
 	}
-}
-
-// ConfigureRouting updates the opt-in adaptive selector without touching
-// accumulated observations. Invalid values fall back to deterministic priority.
-func (h *HealthState) ConfigureRouting(strategy string, halfLife time.Duration, shadow bool) {
-	if h == nil {
-		return
-	}
-	h.mu.Lock()
-	if halfLife > 0 {
-		h.halfLife = halfLife
-	}
-	if strategy != "adaptive" {
-		strategy = "priority"
-	}
-	h.strategy = strategy
-	h.shadow = shadow
-	h.mu.Unlock()
-}
-
-func (h *HealthState) adaptiveEnabledLocked() bool {
-	return h.strategy == "adaptive" && !h.shadow
-}
-
-// AdaptiveEnabled reports whether adaptive ordering is active rather than shadow-only.
-func (h *HealthState) AdaptiveEnabled() bool {
-	if h == nil {
-		return false
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.adaptiveEnabledLocked()
-}
-
-func (h *HealthState) AdaptiveConfigured() bool {
-	if h == nil {
-		return false
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.strategy == "adaptive"
-}
-
-func (h *HealthState) ShadowEnabled() bool {
-	if h == nil {
-		return false
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.shadow
-}
-
-// NextExploration advances once per non-affinity selection. Every tenth turn
-// requests an unknown same-tier candidate when one exists.
-func (h *HealthState) NextExploration(model string) (bool, int64) {
-	if h == nil || !h.AdaptiveConfigured() {
-		return false, 0
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.exploration[model]++
-	count := h.exploration[model]
-	return count%10 == 0, count / 10
-}
-
-func (h *HealthState) RecordShadow(model, actualKey, recommendedKey string) {
-	if h == nil || !h.ShadowEnabled() || actualKey == "" || recommendedKey == "" {
-		return
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	item := h.shadowRecommendations[model]
-	if item == nil {
-		item = &ShadowRecommendation{Model: model}
-		h.shadowRecommendations[model] = item
-	}
-	item.ActualKey = actualKey
-	item.RecommendedKey = recommendedKey
-	item.Observations++
-}
-
-func (h *HealthState) ShadowSnapshot() []ShadowRecommendation {
-	if h == nil {
-		return []ShadowRecommendation{}
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	result := make([]ShadowRecommendation, 0, len(h.shadowRecommendations))
-	for _, item := range h.shadowRecommendations {
-		result = append(result, *item)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].Model < result[j].Model })
-	return result
 }
 
 // Generation returns the current routing-state generation.
@@ -275,8 +155,6 @@ func (h *HealthState) Reset() {
 	h.keys = make(map[string]*healthEntry)
 	h.providers = make(map[string]*healthEntry)
 	h.leases = make(map[uint64]leaseRecord)
-	h.exploration = make(map[string]int64)
-	h.shadowRecommendations = make(map[string]*ShadowRecommendation)
 	h.mu.Unlock()
 }
 
@@ -407,15 +285,6 @@ func (h *HealthState) Finish(lease Lease, result AttemptResult) {
 	keyEntry.lastOutput = result.OutputTokens
 	keyEntry.lastOutputKnown = result.OutputTokensKnown
 	keyEntry.lastActualModel = result.ActualModel
-	if result.Outcome == OutcomeSuccess || isFailure(result.Outcome) {
-		h.decayScoreLocked(keyEntry, now)
-		if result.Outcome == OutcomeSuccess {
-			keyEntry.scoreSuccess++
-		} else {
-			keyEntry.scoreFailure++
-		}
-	}
-
 	switch result.Outcome {
 	case OutcomeSuccess:
 		keyEntry.successes++
@@ -460,138 +329,6 @@ func (h *HealthState) Finish(lease Lease, result AttemptResult) {
 			providerEntry.cooldownUntil = time.Time{}
 		}
 	}
-}
-
-func (h *HealthState) decayScoreLocked(entry *healthEntry, now time.Time) {
-	if entry.scoreUpdatedAt.IsZero() {
-		entry.scoreUpdatedAt = now
-		return
-	}
-	if h.halfLife <= 0 || !now.After(entry.scoreUpdatedAt) {
-		return
-	}
-	factor := math.Pow(0.5, now.Sub(entry.scoreUpdatedAt).Seconds()/h.halfLife.Seconds())
-	entry.scoreSuccess *= factor
-	entry.scoreFailure *= factor
-	entry.scoreUpdatedAt = now
-}
-
-// Reliability returns a decay-weighted Beta(1,1) expectation and sample mass.
-func (h *HealthState) Reliability(model string, key registry.UpstreamKey) (float64, float64) {
-	if h == nil {
-		return 0.5, 0
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	entry := h.keys[makeKeyScope(model, key)]
-	if entry == nil {
-		return 0.5, 0
-	}
-	h.decayScoreLocked(entry, time.Now())
-	samples := entry.scoreSuccess + entry.scoreFailure
-	return (entry.scoreSuccess + 1) / (samples + 2), samples
-}
-
-// ScoreKeys snapshots all candidate scores under one lock/clock observation.
-func (h *HealthState) ScoreKeys(model string, keys []registry.UpstreamKey) map[string]ReliabilityScore {
-	result := make(map[string]ReliabilityScore, len(keys))
-	if h == nil {
-		for _, key := range keys {
-			result[makeKeyScope(model, key)] = ReliabilityScore{Value: 0.5}
-		}
-		return result
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	now := time.Now()
-	for _, key := range keys {
-		entry := h.keys[makeKeyScope(model, key)]
-		if entry == nil {
-			result[makeKeyScope(model, key)] = ReliabilityScore{Value: 0.5}
-			continue
-		}
-		h.decayScoreLocked(entry, now)
-		samples := entry.scoreSuccess + entry.scoreFailure
-		result[makeKeyScope(model, key)] = ReliabilityScore{Value: (entry.scoreSuccess + 1) / (samples + 2), Samples: samples}
-	}
-	return result
-}
-
-// ProviderReliability averages key scores without crossing the provider-priority boundary.
-func (h *HealthState) ProviderReliability(model, provider string, keys []registry.UpstreamKey) float64 {
-	if h == nil {
-		return 0.5
-	}
-	scores := h.ScoreKeys(model, keys)
-	total := 0.0
-	count := 0
-	if len(keys) == 0 {
-		return 0.5
-	}
-	for _, key := range keys {
-		if key.Name != provider {
-			continue
-		}
-		total += scores[makeKeyScope(model, key)].Value
-		count++
-	}
-	if count == 0 {
-		return 0.5
-	}
-	return total / float64(count)
-}
-
-func (h *HealthState) ProviderSamples(model, provider string, keys []registry.UpstreamKey, scores map[string]ReliabilityScore) float64 {
-	total := 0.0
-	minEntry := int(^uint(0) >> 1)
-	for _, key := range keys {
-		if key.Name == provider && key.EntryPriority < minEntry {
-			minEntry = key.EntryPriority
-		}
-	}
-	for _, key := range keys {
-		if key.Name == provider && key.EntryPriority == minEntry {
-			total += scores[makeKeyScope(model, key)].Samples
-		}
-	}
-	return total
-}
-
-// OrderKeys applies deterministic reliability ordering inside one provider and
-// one entry-priority tier. Unknown keys retain their incoming order at the
-// neutral Beta(1,1) prior, providing bounded cold-start exploration.
-func (h *HealthState) OrderKeys(model string, keys []registry.UpstreamKey, explore ...bool) []registry.UpstreamKey {
-	if h == nil || !h.AdaptiveEnabled() || len(keys) < 2 {
-		return keys
-	}
-	return h.OrderKeysWithScores(model, keys, h.ScoreKeys(model, keys), len(explore) > 0 && explore[0])
-}
-
-func (h *HealthState) OrderKeysWithScores(model string, keys []registry.UpstreamKey, scores map[string]ReliabilityScore, explore bool) []registry.UpstreamKey {
-	if h == nil || len(keys) < 2 {
-		return keys
-	}
-	type scoredKey struct {
-		key     registry.UpstreamKey
-		score   float64
-		samples float64
-	}
-	scored := make([]scoredKey, 0, len(keys))
-	for _, key := range keys {
-		score := scores[makeKeyScope(model, key)]
-		scored = append(scored, scoredKey{key: key, score: score.Value, samples: score.Samples})
-	}
-	sort.SliceStable(scored, func(i, j int) bool {
-		if explore && scored[i].samples != scored[j].samples {
-			return scored[i].samples < scored[j].samples
-		}
-		return scored[i].score > scored[j].score
-	})
-	ordered := make([]registry.UpstreamKey, 0, len(scored))
-	for _, item := range scored {
-		ordered = append(ordered, item.key)
-	}
-	return ordered
 }
 
 func (h *HealthState) clearProbe(record leaseRecord, token uint64) {
@@ -710,13 +447,6 @@ func (h *HealthState) Snapshot() []HealthSnapshot {
 			LastAttempt:     entry.lastAttempt,
 			LastDurationMS:  entry.lastDuration,
 			LastActualModel: entry.lastActualModel,
-		}
-		h.decayScoreLocked(entry, now)
-		samples := entry.scoreSuccess + entry.scoreFailure
-		item.ScoreSamples = samples
-		if samples > 0 {
-			reliability := (entry.scoreSuccess + 1) / (samples + 2)
-			item.Reliability = &reliability
 		}
 		if entry.lastFirstChunkKnown {
 			value := entry.lastFirstChunk

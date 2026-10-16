@@ -28,7 +28,7 @@ type Config struct {
 	// Debug enables verbose logging to stderr.
 	Debug bool `yaml:"debug"`
 
-	// RequestLog is optional request recording (sqlite or postgres) with retention.
+	// RequestLog is optional SQLite request recording with retention.
 	RequestLog RequestLogConfig `yaml:"request-log"`
 
 	// Compression enables gzip response compression for clients that advertise
@@ -40,9 +40,6 @@ type Config struct {
 	// (new-api style rule stickiness; process-local memory cache).
 	ChannelAffinity ChannelAffinitySetting `yaml:"channel-affinity"`
 
-	// Routing controls optional same-priority adaptive key selection.
-	Routing RoutingConfig `yaml:"routing"`
-
 	// SSEKeepalive injects protocol-native keepalive frames into silent streams.
 	SSEKeepalive SSEKeepaliveConfig `yaml:"sse-keepalive"`
 
@@ -52,24 +49,6 @@ type Config struct {
 	OpenAIImages      []Provider `yaml:"openai-images"`
 }
 
-// RoutingConfig controls the opt-in reliability-aware selector.
-// Strategy defaults to priority, preserving the historical provider/key order.
-type RoutingConfig struct {
-	Strategy string `yaml:"strategy,omitempty"`  // priority | adaptive
-	HalfLife string `yaml:"half-life,omitempty"` // Go duration; default 72h
-	Shadow   bool   `yaml:"shadow,omitempty"`    // collect scores without changing picks
-}
-
-func (r RoutingConfig) HalfLifeDuration() time.Duration {
-	d, err := time.ParseDuration(r.HalfLife)
-	if err != nil || d <= 0 {
-		return 72 * time.Hour
-	}
-	return d
-}
-
-// CompressionEnabled returns true unless response compression was explicitly
-// disabled. Clients that send no Accept-Encoding are never compressed.
 func (c Config) CompressionEnabled() bool {
 	return c.Compression == nil || *c.Compression
 }
@@ -291,7 +270,7 @@ func positiveDuration(value string, fallback time.Duration) time.Duration {
 // Disabled by default. When enabled, metadata is stored; bodies are optional.
 type RequestLogConfig struct {
 	Enabled bool   `yaml:"enabled"`
-	Backend string `yaml:"backend"` // "sqlite" | "postgres"
+	Backend string `yaml:"backend"` // "sqlite" (the only backend)
 	// Retention deletes whole rows older than this Go duration ("168h"; "7d" is
 	// not valid). "0s" (the default) keeps metadata forever.
 	Retention string `yaml:"retention"`
@@ -300,16 +279,11 @@ type RequestLogConfig struct {
 	// keeping the metadata row. Only matters when store-body is on. "0s" never clears.
 	BodyRetention string `yaml:"body-retention"`
 
-	SQLite   SQLiteLogConfig   `yaml:"sqlite"`
-	Postgres PostgresLogConfig `yaml:"postgres"`
+	SQLite SQLiteLogConfig `yaml:"sqlite"`
 }
 
 type SQLiteLogConfig struct {
 	Path string `yaml:"path"` // default logs/requests.db
-}
-
-type PostgresLogConfig struct {
-	DSN string `yaml:"dsn"`
 }
 
 // Provider is a named upstream entry with multi-key support.
@@ -396,14 +370,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.RequestLog.SQLite.Path == "" {
 		c.RequestLog.SQLite.Path = "logs/requests.db"
-	}
-	if strings.TrimSpace(c.Routing.Strategy) == "" {
-		c.Routing.Strategy = "priority"
-	} else {
-		c.Routing.Strategy = strings.ToLower(strings.TrimSpace(c.Routing.Strategy))
-	}
-	if strings.TrimSpace(c.Routing.HalfLife) == "" {
-		c.Routing.HalfLife = "72h"
 	}
 	if c.ChannelAffinity.MaxEntries <= 0 {
 		c.ChannelAffinity.MaxEntries = 100_000
@@ -528,20 +494,6 @@ func (c *Config) validate() error {
 	if len(c.AnthropicMessages) == 0 && len(c.OpenAIResponses) == 0 && len(c.OpenAICompletions) == 0 {
 		return fmt.Errorf("at least one upstream provider is required")
 	}
-	strategy := strings.ToLower(strings.TrimSpace(c.Routing.Strategy))
-	if strategy == "" {
-		strategy = "priority"
-	}
-	if strategy != "priority" && strategy != "adaptive" {
-		return fmt.Errorf("routing.strategy must be priority or adaptive, got %q", c.Routing.Strategy)
-	}
-	halfLifeValue := strings.TrimSpace(c.Routing.HalfLife)
-	if halfLifeValue == "" {
-		halfLifeValue = "72h"
-	}
-	if halfLife, err := time.ParseDuration(halfLifeValue); err != nil || halfLife <= 0 {
-		return fmt.Errorf("routing.half-life must be a positive Go duration, got %q", c.Routing.HalfLife)
-	}
 	for name, value := range map[string]string{
 		"first-frame-wait": c.SSEKeepalive.FirstFrameWait,
 		"interval":         c.SSEKeepalive.Interval,
@@ -606,11 +558,9 @@ func (c *Config) validate() error {
 		case "sqlite":
 			// ok
 		case "postgres", "postgresql", "pg":
-			if strings.TrimSpace(c.RequestLog.Postgres.DSN) == "" {
-				return fmt.Errorf("request-log.postgres.dsn is required when backend is postgres")
-			}
+			return fmt.Errorf("request-log.backend postgres is no longer supported; use sqlite")
 		default:
-			return fmt.Errorf("request-log.backend must be sqlite or postgres")
+			return fmt.Errorf("request-log.backend must be sqlite")
 		}
 		if _, err := time.ParseDuration(c.RequestLog.Retention); err != nil {
 			return fmt.Errorf("request-log.retention: %w", err)

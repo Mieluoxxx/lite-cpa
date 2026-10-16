@@ -105,18 +105,11 @@ func parseRetryAfter(value string) time.Duration {
 // Providers: openai | openai-response | claude (no Codex).
 func Execute(ctx context.Context, key registry.UpstreamKey, upstreamModel string, source translator.Format, payload []byte, stream bool) (any, error) {
 	baseModel := thinking.ParseSuffix(upstreamModel).ModelName
-	from := source
-	var to translator.Format
-	switch key.Provider {
-	case "openai":
-		to = translator.FormatOpenAI
-	case "openai-response":
-		to = translator.FormatOpenAIResponse
-	case "claude":
-		to = translator.FormatClaude
-	default:
+	spec, ok := upstreams[key.Provider]
+	if !ok {
 		return nil, fmt.Errorf("unknown provider %q", key.Provider)
 	}
+	from, to := source, spec.format
 
 	translated := translator.TranslateRequest(from, to, baseModel, payload, stream)
 	translated, _ = sjson.SetBytes(translated, "model", baseModel)
@@ -130,28 +123,11 @@ func Execute(ctx context.Context, key registry.UpstreamKey, upstreamModel string
 	key, translated = applySpeed(key, baseModel, translated)
 	translated = applyModelVerbosity(to, baseModel, key.Verbosity, translated)
 
-	switch key.Provider {
-	case "openai":
-		if stream {
-			result, err := executeOpenAIStream(ctx, key, from, to, baseModel, payload, translated)
-			return guardResponsesClientStream(ctx, from, baseModel, result, err)
-		}
-		return executeOpenAI(ctx, key, from, to, baseModel, payload, translated)
-	case "openai-response":
-		if stream {
-			result, err := executeResponsesStream(ctx, key, from, to, baseModel, payload, translated)
-			return guardResponsesClientStream(ctx, from, baseModel, result, err)
-		}
-		return executeResponses(ctx, key, from, to, baseModel, payload, translated)
-	case "claude":
-		if stream {
-			result, err := executeClaudeStream(ctx, key, from, to, baseModel, payload, translated)
-			return guardResponsesClientStream(ctx, from, baseModel, result, err)
-		}
-		return executeClaude(ctx, key, from, to, baseModel, payload, translated)
-	default:
-		return nil, fmt.Errorf("unknown provider %q", key.Provider)
+	if stream {
+		result, err := executeStream(ctx, spec, key, from, baseModel, payload, translated)
+		return guardResponsesClientStream(ctx, from, baseModel, result, err)
 	}
+	return executeNonStream(ctx, spec, key, from, baseModel, payload, translated)
 }
 
 // applySpeed enforces the model-level fast tier. Configured "fast" injects the
@@ -231,98 +207,44 @@ func appendHeaderToken(headers map[string]string, name, token string) map[string
 	return merged
 }
 
-func executeOpenAI(ctx context.Context, key registry.UpstreamKey, from, to translator.Format, model string, original, body []byte) (*Result, error) {
-	url := strings.TrimSuffix(key.BaseURL, "/") + "/chat/completions"
-	resp, err := doJSON(ctx, key, url, body, false)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, newStatusError(resp, data)
-	}
-	var param any
-	out := translator.TranslateNonStream(ctx, to, from, model, original, body, data, &param)
-	return &Result{Status: resp.StatusCode, Headers: resp.Header.Clone(), Body: out}, nil
+// upstreamSpec is what differs between the three upstream protocols; the
+// request/response plumbing around it is shared.
+type upstreamSpec struct {
+	format      translator.Format
+	path        string
+	defaultBase string
+	protocol    streamProtocol
+	do          func(ctx context.Context, key registry.UpstreamKey, url string, body []byte, stream bool) (*http.Response, error)
 }
 
-func executeOpenAIStream(ctx context.Context, key registry.UpstreamKey, from, to translator.Format, model string, original, body []byte) (*StreamResult, error) {
-	body, _ = sjson.SetBytes(body, "stream_options.include_usage", true)
-	body, _ = sjson.SetBytes(body, "stream", true)
-	url := strings.TrimSuffix(key.BaseURL, "/") + "/chat/completions"
-	resp, err := doJSON(ctx, key, url, body, true)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		data, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		return nil, newStatusError(resp, data)
-	}
-	// Same-format: forward upstream SSE verbatim so [DONE] and framing stay intact.
-	if from == to {
-		return streamPassthrough(ctx, resp, streamProtocolChat)
-	}
-	return streamSSE(ctx, resp, from, to, model, original, body, streamProtocolChat), nil
+var upstreams = map[string]upstreamSpec{
+	"openai":          {format: translator.FormatOpenAI, path: "/chat/completions", protocol: streamProtocolChat, do: doJSON},
+	"openai-response": {format: translator.FormatOpenAIResponse, path: "/responses", protocol: streamProtocolResponses, do: doJSON},
+	"claude":          {format: translator.FormatClaude, path: "/v1/messages", defaultBase: "https://api.anthropic.com", protocol: streamProtocolClaude, do: doClaude},
 }
 
-func executeResponses(ctx context.Context, key registry.UpstreamKey, from, to translator.Format, model string, original, body []byte) (*Result, error) {
-	// Standard OpenAI Responses API: POST {base}/responses
-	body, _ = sjson.SetBytes(body, "stream", false)
-	url := strings.TrimSuffix(key.BaseURL, "/") + "/responses"
-	resp, err := doJSON(ctx, key, url, body, false)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, newStatusError(resp, data)
-	}
-	var param any
-	out := translator.TranslateNonStream(ctx, to, from, model, original, body, data, &param)
-	return &Result{Status: resp.StatusCode, Headers: resp.Header.Clone(), Body: out}, nil
-}
-
-func executeResponsesStream(ctx context.Context, key registry.UpstreamKey, from, to translator.Format, model string, original, body []byte) (*StreamResult, error) {
-	body, _ = sjson.SetBytes(body, "stream", true)
-	url := strings.TrimSuffix(key.BaseURL, "/") + "/responses"
-	resp, err := doJSON(ctx, key, url, body, true)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		data, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		return nil, newStatusError(resp, data)
-	}
-	// Same-format: preserve event:/data: association (do not reframe each line).
-	if from == to {
-		return streamPassthrough(ctx, resp, streamProtocolResponses)
-	}
-	return streamSSE(ctx, resp, from, to, model, original, body, streamProtocolResponses), nil
-}
-
-func executeClaude(ctx context.Context, key registry.UpstreamKey, from, to translator.Format, model string, original, body []byte) (*Result, error) {
-	// Cross-format non-stream clients still request Anthropic SSE because the
-	// ported NonStream translators aggregate data: event lines into one JSON body.
-	// Same-format clients get a normal non-stream JSON message.
-	useUpstreamStream := from != to
-	body, _ = sjson.SetBytes(body, "stream", useUpstreamStream)
-
+func (spec upstreamSpec) url(key registry.UpstreamKey) string {
 	base := key.BaseURL
 	if base == "" {
-		base = "https://api.anthropic.com"
+		base = spec.defaultBase
 	}
-	url := strings.TrimSuffix(base, "/") + "/v1/messages"
-	resp, err := doClaude(ctx, key, url, body, useUpstreamStream)
+	return strings.TrimSuffix(base, "/") + spec.path
+}
+
+func executeNonStream(ctx context.Context, spec upstreamSpec, key registry.UpstreamKey, from translator.Format, model string, original, body []byte) (*Result, error) {
+	to := spec.format
+	upstreamStream := false
+	switch to {
+	case translator.FormatOpenAIResponse:
+		body, _ = sjson.SetBytes(body, "stream", false)
+	case translator.FormatClaude:
+		// Cross-format non-stream clients still request Anthropic SSE because the
+		// ported NonStream translators aggregate data: event lines into one JSON body.
+		// Same-format clients get a normal non-stream JSON message.
+		upstreamStream = from != to
+		body, _ = sjson.SetBytes(body, "stream", upstreamStream)
+	}
+	resp, err := spec.do(ctx, key, spec.url(key), body, upstreamStream)
 	if err != nil {
 		return nil, err
 	}
@@ -334,7 +256,7 @@ func executeClaude(ctx context.Context, key registry.UpstreamKey, from, to trans
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, newStatusError(resp, data)
 	}
-	if useUpstreamStream && streamCompletionFromBody(data, streamProtocolClaude) != StreamCompleted {
+	if upstreamStream && streamCompletionFromBody(data, spec.protocol) != StreamCompleted {
 		return nil, errors.New("upstream Claude stream ended without a successful terminal event")
 	}
 	var param any
@@ -342,14 +264,13 @@ func executeClaude(ctx context.Context, key registry.UpstreamKey, from, to trans
 	return &Result{Status: resp.StatusCode, Headers: resp.Header.Clone(), Body: out}, nil
 }
 
-func executeClaudeStream(ctx context.Context, key registry.UpstreamKey, from, to translator.Format, model string, original, body []byte) (*StreamResult, error) {
-	body, _ = sjson.SetBytes(body, "stream", true)
-	base := key.BaseURL
-	if base == "" {
-		base = "https://api.anthropic.com"
+func executeStream(ctx context.Context, spec upstreamSpec, key registry.UpstreamKey, from translator.Format, model string, original, body []byte) (*StreamResult, error) {
+	to := spec.format
+	if to == translator.FormatOpenAI {
+		body, _ = sjson.SetBytes(body, "stream_options.include_usage", true)
 	}
-	url := strings.TrimSuffix(base, "/") + "/v1/messages"
-	resp, err := doClaude(ctx, key, url, body, true)
+	body, _ = sjson.SetBytes(body, "stream", true)
+	resp, err := spec.do(ctx, key, spec.url(key), body, true)
 	if err != nil {
 		return nil, err
 	}
@@ -358,10 +279,12 @@ func executeClaudeStream(ctx context.Context, key registry.UpstreamKey, from, to
 		resp.Body.Close()
 		return nil, newStatusError(resp, data)
 	}
+	// Same-format: forward upstream SSE verbatim so [DONE], framing and the
+	// event:/data: association stay intact.
 	if from == to {
-		return streamPassthrough(ctx, resp, streamProtocolClaude)
+		return streamPassthrough(ctx, resp, spec.protocol)
 	}
-	return streamSSE(ctx, resp, from, to, model, original, body, streamProtocolClaude), nil
+	return streamSSE(ctx, resp, from, to, model, original, body, spec.protocol), nil
 }
 
 // ExecuteImage forwards an OpenAI Images API request verbatim to an upstream
@@ -400,20 +323,7 @@ func ExecuteImage(ctx context.Context, key registry.UpstreamKey, payload []byte,
 }
 
 func doJSON(ctx context.Context, key registry.UpstreamKey, url string, body []byte, stream bool) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if key.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+key.APIKey)
-	}
-	if stream {
-		req.Header.Set("Accept", "text/event-stream")
-		req.Header.Set("Cache-Control", "no-cache")
-	}
-	applyCustomHeaders(req, key.Headers)
-	return httpx.Do(ctx, httpx.Client(key.ProxyURL), req)
+	return doRaw(ctx, key, url, body, "application/json", stream)
 }
 
 // doRaw is like doJSON but preserves the caller's Content-Type. Image edits are
@@ -467,9 +377,6 @@ func doClaude(ctx context.Context, key registry.UpstreamKey, url string, body []
 
 func applyCustomHeaders(req *http.Request, headers map[string]string) {
 	for k, v := range headers {
-		if strings.EqualFold(k, "x-lite-upstream-model") {
-			continue
-		}
 		if k != "" && v != "" {
 			req.Header.Set(k, v)
 		}

@@ -170,11 +170,10 @@ func TestForwardHealthUsesResolvedModelKey(t *testing.T) {
 	}
 }
 
-func TestAdaptiveAffinityStillPrefersThenRespectsCooldown(t *testing.T) {
+func TestAffinityPrefersThenRespectsCooldown(t *testing.T) {
 	enabled := true
 	cfg := &config.Config{
 		RequestRetry: 1,
-		Routing:      config.RoutingConfig{Strategy: "adaptive", HalfLife: "72h"},
 		ChannelAffinity: config.ChannelAffinitySetting{
 			Enabled: &enabled,
 			Rules:   []config.ChannelAffinityRule{{Name: "session", KeySources: []config.ChannelAffinityKeySource{{Type: "gjson", Path: "metadata.user_id"}}}},
@@ -199,7 +198,7 @@ func TestAdaptiveAffinityStillPrefersThenRespectsCooldown(t *testing.T) {
 	first := selected[0]
 	call(true)
 	if len(selected) != 3 || selected[1] != first || selected[2] == first {
-		t.Fatalf("adaptive affinity sequence=%v, want sticky then cooled fallback", selected)
+		t.Fatalf("affinity sequence=%v, want sticky then cooled fallback", selected)
 	}
 }
 

@@ -39,13 +39,7 @@ func Open(cfg config.RequestLogConfig) (*Logger, error) {
 	if err != nil {
 		return nil, err
 	}
-	var store Store
-	switch strings.ToLower(strings.TrimSpace(cfg.Backend)) {
-	case "postgres", "postgresql", "pg":
-		store, err = OpenPostgres(cfg.Postgres.DSN)
-	default:
-		store, err = OpenSQLite(cfg.SQLite.Path)
-	}
+	store, err := OpenSQLite(cfg.SQLite.Path)
 	if err != nil {
 		return nil, err
 	}
